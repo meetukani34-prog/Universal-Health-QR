@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Database files
+*.db
+healthqr.db
+
+# Environment variables (if you ever add them)
+.env
+.env.local
+
+# Windows reserved names
+nul
