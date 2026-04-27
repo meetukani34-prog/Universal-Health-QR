@@ -233,9 +233,10 @@ function buildContactEmailHtml(data) {
 
 // Initialize Firebase
 if (admin.apps.length === 0) {
-  if (process.env.SERVICE_ACCOUNT_KEY) {
+  const saKey = process.env.SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (saKey) {
     try {
-      const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
+      const serviceAccount = JSON.parse(saKey);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
