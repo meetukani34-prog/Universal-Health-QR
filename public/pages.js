@@ -392,7 +392,7 @@ function renderAptCard(a, status) {
 function initDoctorSSE(doc) {
   if (!doc || APP.state.doctorSSERunning) return;
   APP.state.doctorSSERunning = true;
-  const ev = new EventSource(`/api/sse/doctor/${doc.id}`);
+  const ev = new EventSource(window.API_BASE_URL + `/api/sse/doctor/${doc.id}`);
   
   ev.addEventListener('new_request', (e) => {
     const data = JSON.parse(e.data);
@@ -621,7 +621,7 @@ function renderPatientAccess(app, patientId) {
     emergencyUrl += `?doctor_id=${encodeURIComponent(doc.id)}&doctor_name=${encodeURIComponent(doc.name||'')}&doctor_specialization=${encodeURIComponent(doc.specialization||'')}`;
   }
 
-  fetch(emergencyUrl).then(r => r.json()).then(data => {
+  fetch(window.API_BASE_URL + emergencyUrl).then(r => r.json()).then(data => {
     if (data.error) { app.innerHTML = `${navbar()}<div class="container" style="padding:4rem 0;text-align:center"><h2>Patient Not Found</h2><p class="text-muted">${data.error}</p><a href="#/scan" class="btn btn-primary mt-3">${icon('qr_code_scanner')} Try Again</a></div>`; return; }
     APP.state.viewingPatient = data;
     APP.state.viewingPatientId = patientId;
@@ -646,7 +646,7 @@ function triggerEmergencyModal(patientId) {
     emergencyUrl += `?doctor_id=${encodeURIComponent(doc.id)}&doctor_name=${encodeURIComponent(doc.name||'')}&doctor_specialization=${encodeURIComponent(doc.specialization||'')}`;
   }
 
-  fetch(emergencyUrl).then(r => r.json()).then(data => {
+  fetch(window.API_BASE_URL + emergencyUrl).then(r => r.json()).then(data => {
     if (data.error) { body.innerHTML = `<div class="text-center" style="padding:2rem"><h3>Not Found</h3><p class="text-muted">${data.error}</p></div>`; return; }
     showEmergencyView(body, data, patientId, true);
   }).catch(() => {

@@ -1,5 +1,11 @@
 // --- GLOBAL CORE UTILITIES ---
 window.APP = { state: {} };
+// --- API CONFIGURATION ---
+// In production, set this to your Railway URL. In dev, it stays empty for local proxying.
+window.API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
+  ? '' 
+  : 'https://universal-health-qr-production.up.railway.app'; // Placeholder - user should update this
+
 console.log('%c[Sarvam] Booting v1.1.2 @ ' + new Date().toLocaleTimeString(), 'color:#10B981;font-weight:bold');
 
 window.toggleTheme = function () {
@@ -84,7 +90,8 @@ function showToast(msg, type = 'info') {
 async function api(url, opts = {}) {
   try {
     const defaultHeaders = opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' };
-    const r = await fetch(url, {
+    const fullUrl = url.startsWith('http') ? url : (window.API_BASE_URL + url);
+    const r = await fetch(fullUrl, {
       ...opts,
       headers: { ...defaultHeaders, ...(opts.headers || {}) },
       body: opts.body instanceof FormData ? opts.body : (opts.body ? JSON.stringify(opts.body) : undefined)
