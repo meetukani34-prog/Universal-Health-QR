@@ -47,6 +47,8 @@ function renderDoctorAuth(app) {
   const showOtpStep = (email, userName, dOtp) => {
     devOtp = dOtp;
     pendingEmail = email;
+    // --- DEBUG: LOG OTP STATUS ---
+    console.log('[Doctor Login] Dev OTP Received:', dOtp);
 
     const loginCard = document.getElementById('doc-login');
     if (!loginCard) return;
@@ -57,16 +59,16 @@ function renderDoctorAuth(app) {
         <p>A 6-digit code was sent to <strong>${email}</strong></p>
       </div>
 
-      ${devOtp ? `
-      <div class="card mb-3" style="background:var(--secondary-container);border:1px dashed var(--secondary);padding:1rem;text-align:center">
-        <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--secondary);font-weight:700;margin-bottom:0.5rem">
-          ${icon('speed')} Network Delay Fallback
+      ${dOtp ? `
+      <div class="card mb-4" style="background:rgba(16, 185, 129, 0.1);border:2px dashed var(--success);padding:1.5rem;text-align:center;border-radius:1rem;animation: pulse 2s infinite;">
+        <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--success);font-weight:800;margin-bottom:0.75rem">
+          ${icon('developer_mode')} DEV MODE: OTP FALLBACK
         </div>
-        <div style="font-size:1.5rem;font-weight:800;color:var(--on-secondary-container);letter-spacing:0.25rem">
-          ${devOtp}
+        <div style="font-size:2rem;font-weight:900;color:var(--success);letter-spacing:0.5rem;font-family:monospace">
+          ${dOtp}
         </div>
-        <p style="font-size:0.75rem;color:var(--on-secondary-container);margin-top:0.5rem;opacity:0.8">
-          Please use this code to continue
+        <p style="font-size:0.875rem;color:var(--success);margin-top:0.75rem;font-weight:600">
+          (Use this code to proceed during testing)
         </p>
       </div>
       ` : ''}
