@@ -962,7 +962,7 @@ async function showClinicalView(app, patientId) {
       fd.append('medications', '[]'); // Quick upload is mainly for documents
       
       try {
-        const res = await fetch('/api/prescriptions', { method: 'POST', body: fd }).then(r => r.json());
+        const res = await fetch(window.API_BASE_URL + '/api/prescriptions', { method: 'POST', body: fd }).then(r => r.json());
         if (res.error) throw new Error(res.error);
         showToast('Medical document added!', 'success');
         setTimeout(() => showClinicalView(app, pid), 800); // Reload view
@@ -1128,7 +1128,7 @@ function renderAddPrescription(app) {
     if (labFile) fd.set('lab_report', labFile);
 
     try {
-      await fetch('/api/prescriptions', { method: 'POST', body: fd }).then(r => r.json());
+      await fetch(window.API_BASE_URL + '/api/prescriptions', { method: 'POST', body: fd }).then(r => r.json());
       showToast('Prescription added!', 'success');
       APP.state.prescriptionPatientId = '';
       if (doc) navigate('/doctor-dashboard'); else navigate('/');

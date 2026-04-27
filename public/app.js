@@ -882,7 +882,7 @@ function renderPatientRegistration(app, verifiedEmail) {
     allergies.forEach(a => fd.append('allergies', a));
     conditions.forEach(c => fd.append('chronic_conditions', c));
     try {
-      const data = await fetch('/api/patients/register', { method: 'POST', body: fd }).then(r => r.json());
+      const data = await fetch(window.API_BASE_URL + '/api/patients/register', { method: 'POST', body: fd }).then(r => r.json());
       if (data.error) { showToast(data.error, 'error'); return; }
       showToast('Registration successful!', 'success');
       document.getElementById('reg-form-wrap').classList.add('hidden');
@@ -1009,7 +1009,7 @@ function renderDoctorRegistration(app, verifiedEmail) {
   </div>`;
 
   // Fetch hospitals
-  fetch('/api/hospitals/list').then(r => r.json()).then(data => {
+  fetch(window.API_BASE_URL + '/api/hospitals/list').then(r => r.json()).then(data => {
     const select = document.getElementById('doc-hospital-id');
     data.hospitals.forEach(h => {
       select.innerHTML += `<option value="${h.id}">${h.name} (${h.type || 'Hospital'}) - ${h.city}</option>`;
@@ -1052,7 +1052,7 @@ function renderDoctorRegistration(app, verifiedEmail) {
     }
 
     try {
-      const data = await fetch('/api/doctors/register', { method: 'POST', body: fd }).then(r => r.json());
+      const data = await fetch(window.API_BASE_URL + '/api/doctors/register', { method: 'POST', body: fd }).then(r => r.json());
       if (data.error) throw new Error(data.error);
       showToast('Doctor registration successful!', 'success');
       navigate('/doctor-login');
@@ -2816,7 +2816,7 @@ async function sendAIMessage(message, patientId) {
   scrollToChatBottom();
 
   try {
-    const response = await fetch('/api/ai/chat', {
+    const response = await fetch(window.API_BASE_URL + '/api/ai/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
@@ -3434,7 +3434,7 @@ function renderMHChat(app) {
     win.scrollTop = win.scrollHeight;
 
     try {
-      const response = await fetch('/api/mental-health/chat', {
+      const response = await fetch(window.API_BASE_URL + '/api/mental-health/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages, stream: true })
@@ -3942,7 +3942,7 @@ async function handleContactSubmit(e) {
     btn.disabled = true;
     btn.innerHTML = `${icon('sync', 'spin')} Sending...`;
 
-    const res = await fetch('/api/contact', {
+    const res = await fetch(window.API_BASE_URL + '/api/contact', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
