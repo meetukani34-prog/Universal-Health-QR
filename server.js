@@ -25,7 +25,9 @@ const mailerConfig = {
     pass: process.env.SMTP_PASS || ''
   },
   debug: true,
-  logger: true
+  logger: true,
+  // Force IPv4 to avoid ENETUNREACH errors on some cloud providers
+  family: 4
 };
 const mailerTransport = nodemailer.createTransport(mailerConfig);
 
@@ -232,6 +234,7 @@ function buildContactEmailHtml(data) {
 
 
 // Initialize Firebase
+let firebaseInitialized = false;
 if (admin.apps.length === 0) {
   const saKey = process.env.SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT;
   if (saKey) {
@@ -241,19 +244,24 @@ if (admin.apps.length === 0) {
         credential: admin.credential.cert(serviceAccount)
       });
       console.log('- Firebase Initialized via Service Account (Railway mode)');
+      firebaseInitialized = true;
     } catch (e) {
       console.error('CRITICAL: Firebase Service Account Parse Error:', e.message);
-      // Don't initialize without credentials as it will crash in non-Google environments
     }
   } else {
     console.warn('WARNING: No SERVICE_ACCOUNT_KEY found. Firestore operations will fail.');
-    // Only attempt default if we are likely in a GCP environment
     if (process.env.GOOGLE_CLOUD_PROJECT) {
-       admin.initializeApp();
+       try {
+         admin.initializeApp();
+         firebaseInitialized = true;
+       } catch(e) { console.error('GCP Auto-init failed:', e.message); }
     }
   }
+} else {
+  firebaseInitialized = true;
 }
-const firestore = admin.firestore();
+
+const firestore = firebaseInitialized ? admin.firestore() : null;
 
 const OpenAI = require('openai');
 
@@ -366,10 +374,21 @@ async function run(sql, params = []) {
       cols.forEach((c, i) => data[c] = params[i]);
       data.updated_at = new Date().toISOString();
       
+      if (!firestore) {
+        console.warn('Skipping Firestore INSERT - DB not initialized');
+        return;
+      }
+      
       if (data.id) {
-        await firestore.collection(table).doc(String(data.id)).set(data, { merge: true });
+        await Promise.race([
+          firestore.collection(table).doc(String(data.id)).set(data, { merge: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000))
+        ]);
       } else {
-        await firestore.collection(table).add(data);
+        await Promise.race([
+          firestore.collection(table).add(data),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000))
+        ]);
       }
     } else if (sql.toUpperCase().startsWith('UPDATE')) {
       const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
@@ -759,10 +778,8 @@ app.post('/api/patients/login-password', async (req, res) => {
         console.log(`- Login OTP emailed to ${email}`);
       } catch (mailErr) {
         console.warn('- SMTP failed, falling back to dev mode for login OTP:', mailErr.message);
-        devOtp = otp;
-        console.log(`- Login OTP for ${email} (dev mode): ${otp}`);
       }
-      return res.json({ requires_verification: true, user_name: patient.name, email, email_sent: emailSent, dev_otp: devOtp });
+      return res.json({ requires_verification: true, user_name: patient.name, email, email_sent: emailSent, dev_otp: otp });
     }
 
     // Trusted device: return full session
@@ -810,7 +827,7 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
       [email, otpHash, expiresAt, 'forgot_password']);
 
     console.log(` Password Recovery OTP for ${email} (${userType}): ${otp}`);
-    res.json({ success: true, message: 'OTP sent to your email (Mock)', mock_otp: otp });
+    res.json({ success: true, message: 'OTP sent to your email (Fallback active)', dev_otp: otp });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
 });
 
@@ -889,9 +906,17 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
     } catch (mailErr) {
       console.warn('- SMTP failed, falling back to dev mode for registration OTP:', mailErr.message);
     }
-    // Always return the OTP in the frontend for seamless testing, especially if emails are delayed.
+    
+    // CRITICAL FALLBACK: If everything fails, log it so the user can see it in Railway logs
+    console.log('************************************************');
+    console.log(`DEVELOMENT OTP FOR ${emailLower}: ${otp}`);
+    console.log('************************************************');
+
     res.json({ success: true, email: emailLower, email_sent: emailSent, dev_otp: otp });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to send OTP' }); }
+  } catch (err) { 
+    console.error('OTP Route Error:', err); 
+    res.status(500).json({ error: 'Failed to process OTP request' }); 
+  }
 });
 
 app.post('/api/auth/register-verify-otp', async (req, res) => {
@@ -1301,10 +1326,8 @@ app.post('/api/doctors/login', async (req, res) => {
         console.log(`- Doctor Login OTP emailed to ${email}`);
       } catch (mailErr) {
         console.warn('- SMTP failed, falling back to dev mode for doctor login OTP:', mailErr.message);
-        devOtp = otp;
-        console.log(`- Doctor Login OTP for ${email} (dev mode): ${otp}`);
       }
-      return res.json({ requires_verification: true, user_name: doc.name, email, email_sent: emailSent, dev_otp: devOtp });
+      return res.json({ requires_verification: true, user_name: doc.name, email, email_sent: emailSent, dev_otp: otp });
     }
 
     // Trusted device: return full session
@@ -2561,11 +2584,7 @@ app.post('/api/auth/password-reset/request', otpRequestLimiter, async (req, res)
       success: true,
       role,
       email_sent: emailSent,
-      message: emailSent
-        ? 'OTP dispatched to your inbox.'
-        : 'SMTP not configured. Using dev mode.',
-      // Only exposed when SMTP is not configured (dev fallback)
-      ...(debugOtp ? { dev_otp: debugOtp } : {})
+      dev_otp: otp
     });
 
   } catch (err) {

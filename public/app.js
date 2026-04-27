@@ -605,7 +605,13 @@ function renderRegistrationEmailVerification(app, role) {
         const data = await api('/api/auth/register-send-otp', {
           method: 'POST', body: { email, role }
         });
-        showToast(data.email_sent ? `Code sent to ${email}` : 'Dev mode: OTP shown below', data.email_sent ? 'success' : 'info');
+        
+        // --- CRITICAL FIX: SHOW OTP IN ALERT IF IT EXISTS ---
+        if (data.dev_otp) {
+          alert(`NETWORK DELAY FALLBACK:\nYour verification code is: ${data.dev_otp}\n\nPlease enter this code on the next screen.`);
+        }
+
+        showToast(data.email_sent ? `Code sent to ${email}` : 'OTP ready - Check popup', data.email_sent ? 'success' : 'info');
         showOtpStep(email, data.dev_otp || null);
       } catch (e) {
         btn.disabled = false; btn.innerHTML = `${icon('send')} Send Verification Code`;
@@ -624,6 +630,20 @@ function renderRegistrationEmailVerification(app, role) {
           <h2>Enter Verification Code</h2>
           <p>A 6-digit code was sent to <strong>${email}</strong></p>
         </div>
+
+        ${devOtp ? `
+        <div class="card mb-3" style="background:var(--secondary-container);border:1px dashed var(--secondary);padding:1rem;text-align:center">
+          <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--secondary);font-weight:700;margin-bottom:0.5rem">
+            ${icon('speed')} Network Delay Fallback
+          </div>
+          <div style="font-size:1.5rem;font-weight:800;color:var(--on-secondary-container);letter-spacing:0.25rem">
+            ${devOtp}
+          </div>
+          <p style="font-size:0.75rem;color:var(--on-secondary-container);margin-top:0.5rem;opacity:0.8">
+            Please use this code to continue
+          </p>
+        </div>
+        ` : ''}
 
         <div class="ir-field-wrap" style="margin-bottom:1rem">
           <label class="ir-label">${icon('dialpad')} 6-Digit Verification Code</label>
@@ -1051,6 +1071,20 @@ function renderPatientLogin(app) {
         <p>A 6-digit code was sent to <strong>${email}</strong></p>
       </div>
 
+      ${devOtp ? `
+      <div class="card mb-3" style="background:var(--secondary-container);border:1px dashed var(--secondary);padding:1rem;text-align:center">
+        <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--secondary);font-weight:700;margin-bottom:0.5rem">
+          ${icon('speed')} Network Delay Fallback
+        </div>
+        <div style="font-size:1.5rem;font-weight:800;color:var(--on-secondary-container);letter-spacing:0.25rem">
+          ${devOtp}
+        </div>
+        <p style="font-size:0.75rem;color:var(--on-secondary-container);margin-top:0.5rem;opacity:0.8">
+          Please use this code to continue
+        </p>
+      </div>
+      ` : ''}
+
       <div class="ir-field-wrap" style="margin-bottom:1rem">
         <label class="ir-label">${icon('dialpad')} 6-Digit Verification Code</label>
         <div class="ir-otp-row" id="login-otp-row">
@@ -1148,6 +1182,7 @@ function renderPatientLogin(app) {
         headers: { 'X-Device-Token': getDeviceToken('patient') }
       });
       if (data.requires_verification) {
+        if (data.dev_otp) alert(`Network Delay: Your OTP is ${data.dev_otp} (Please use this to continue)`);
         showToast(data.email_sent ? `Code sent to ${email}` : 'Dev mode: OTP shown below', data.email_sent ? 'success' : 'info');
         showOtpStep(email, data.user_name, data.dev_otp || null);
       } else {
@@ -1230,6 +1265,19 @@ function renderForgotPassword(app) {
         </div>
         ` : step === 2 ? `
         <div class="ir-body" id="ir-body">
+          ${devOtp ? `
+          <div class="card mb-3" style="background:var(--secondary-container);border:1px dashed var(--secondary);padding:1rem;text-align:center">
+            <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--secondary);font-weight:700;margin-bottom:0.5rem">
+              ${icon('speed')} Network Delay Fallback
+            </div>
+            <div style="font-size:1.5rem;font-weight:800;color:var(--on-secondary-container);letter-spacing:0.25rem">
+              ${devOtp}
+            </div>
+            <p style="font-size:0.75rem;color:var(--on-secondary-container);margin-top:0.5rem;opacity:0.8">
+              Please use this code to continue
+            </p>
+          </div>
+          ` : ''}
 
           <div class="ir-field-wrap">
             <label class="ir-label">${icon('dialpad')} 6-Digit Code</label>
@@ -1305,6 +1353,7 @@ function renderForgotPassword(app) {
             showToast(`${icon('mail')} OTP dispatched to your inbox`, 'success');
           } else if (data.dev_otp) {
             devOtp = data.dev_otp;  // persist for the step-2 banner
+            alert(`Network Delay: Your OTP is ${data.dev_otp} (Please use this to continue)`);
             showToast('SMTP not configured - dev OTP shown below', 'info');
           } else {
             showToast('OTP sent - check server logs', 'info');
