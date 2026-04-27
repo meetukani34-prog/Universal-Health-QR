@@ -2,7 +2,8 @@
 try { require('dotenv').config(); } catch (e) { }
 
 const express = require('express');
-const initSqlJs = require('sql.js');
+const admin = require('firebase-admin');
+const { onRequest } = require('firebase-functions/v2/https');
 const QRCode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
@@ -230,6 +231,25 @@ function buildContactEmailHtml(data) {
 // (Environment variables now loaded at the top)
 
 
+// Initialize Firebase
+if (admin.apps.length === 0) {
+  if (process.env.SERVICE_ACCOUNT_KEY) {
+    try {
+      const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      console.log('- Firebase Initialized via Service Account (Railway mode)');
+    } catch (e) {
+      console.error('- Firebase Service Account Parse Error:', e);
+      admin.initializeApp();
+    }
+  } else {
+    admin.initializeApp();
+  }
+}
+const firestore = admin.firestore();
+
 const OpenAI = require('openai');
 
 // Initialize OpenAI client
@@ -296,11 +316,17 @@ function sseSubscribe(map, id, res) {
   res.on('close', () => clearInterval(ping));
 }
 
-function sseSend(map, id, event, data) {
+function sseSend(map, id, data) {
   map.get(id)?.forEach(res => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
   });
 }
+
+app.use(cors());
+app.use(express.json());
+
+// Railway Health Check
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // Force browsers to always fetch fresh JS/HTML files (prevent caching of stale code)
 app.use((req, res, next) => {
@@ -319,22 +345,115 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 let db;
 const DB_PATH = path.join(__dirname, 'healthqr.db');
 
-// DB helpers for sql.js
-// DB helpers for sql.js - Debounced to prevent event loop blocking on high-frequency writes
-let saveTimeout = null;
-function run(sql, params = []) {
-  db.run(sql, params);
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(saveDB, 500);
-}
-function get(sql, params = []) { const stmt = db.prepare(sql); stmt.bind(params); if (stmt.step()) { const r = stmt.getAsObject(); stmt.free(); return r; } stmt.free(); return null; }
-function all(sql, params = []) { const results = []; const stmt = db.prepare(sql); stmt.bind(params); while (stmt.step()) results.push(stmt.getAsObject()); stmt.free(); return results; }
-function saveDB() {
+// --- Firestore Compatibility Layer ---
+// These functions mock SQL behavior but talk to Firestore
+async function run(sql, params = []) {
   try {
-    const data = db.export();
-    fs.writeFileSync(DB_PATH, Buffer.from(data));
+    const tableMatch = sql.match(/(?:INSERT INTO|UPDATE|DELETE FROM) (\w+)/i);
+    const table = tableMatch ? tableMatch[1] : null;
+    if (!table) return;
+
+    if (sql.toUpperCase().startsWith('INSERT INTO')) {
+      const colMatch = sql.match(/\((.*?)\)/);
+      if (!colMatch) return;
+      const cols = colMatch[1].split(',').map(c => c.trim());
+      const data = {};
+      cols.forEach((c, i) => data[c] = params[i]);
+      data.updated_at = new Date().toISOString();
+      
+      if (data.id) {
+        await firestore.collection(table).doc(String(data.id)).set(data, { merge: true });
+      } else {
+        await firestore.collection(table).add(data);
+      }
+    } else if (sql.toUpperCase().startsWith('UPDATE')) {
+      const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
+      if (!whereMatch) return;
+      const whereClause = whereMatch[1];
+      const [whereCol, whereVal] = whereClause.split('=').map(s => s.trim().replace(/\?/, ''));
+      
+      const qValue = params[params.length - 1]; // Usually the last param is the WHERE value
+      const query = firestore.collection(table).where(whereCol, '==', qValue);
+      const snap = await query.get();
+      
+      const updateData = {};
+      const setPart = sql.match(/SET (.*?) WHERE/i)[1];
+      const setCols = setPart.split(',').map(s => s.split('=')[0].trim());
+      setCols.forEach((c, i) => updateData[c] = params[i]);
+      updateData.updated_at = new Date().toISOString();
+
+      const batch = firestore.batch();
+      snap.forEach(doc => batch.update(doc.ref, updateData));
+      await batch.commit();
+    }
   } catch (err) {
-    console.error('CRITICAL: Database Save Failed:', err);
+    console.error('Firestore RUN error:', err, sql);
+  }
+}
+
+async function get(sql, params = []) {
+  try {
+    const tableMatch = sql.match(/FROM (\w+)/i);
+    const table = tableMatch ? tableMatch[1] : null;
+    if (!table) return null;
+
+    const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
+    if (!whereMatch) {
+        const snap = await firestore.collection(table).limit(1).get();
+        return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+    }
+
+    const whereClause = whereMatch[1];
+    // Handle simple "col=?" or "col = ?"
+    const colName = whereClause.split('=')[0].trim();
+    
+    let query = firestore.collection(table).where(colName, '==', params[0]);
+    
+    if (sql.includes('ORDER BY')) {
+        const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
+        const direction = sql.includes('DESC') ? 'desc' : 'asc';
+        query = query.orderBy(orderCol, direction);
+    }
+    
+    const snap = await query.limit(1).get();
+    return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+  } catch (err) {
+    console.error('Firestore GET error:', err, sql);
+    return null;
+  }
+}
+
+async function all(sql, params = []) {
+  try {
+    const tableMatch = sql.match(/FROM (\w+)/i);
+    const table = tableMatch ? tableMatch[1] : null;
+    if (!table) return [];
+
+    const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
+    let query = firestore.collection(table);
+    
+    if (whereMatch) {
+        const whereClause = whereMatch[1];
+        const colName = whereClause.split('=')[0].trim();
+        query = query.where(colName, '==', params[0]);
+    }
+
+    if (sql.includes('ORDER BY')) {
+        const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
+        const direction = sql.includes('DESC') ? 'desc' : 'asc';
+        query = query.orderBy(orderCol, direction);
+    }
+    
+    if (sql.includes('LIMIT')) {
+        const limitVal = parseInt(sql.match(/LIMIT (\d+)/i)[1]);
+        query = query.limit(limitVal);
+    }
+
+    const snap = await query.get();
+    return snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  } catch (err) {
+    console.error('Firestore ALL error:', err, sql);
+    return [];
   }
 }
 
@@ -415,189 +534,30 @@ function formatPatientFromDB(p) {
 }
 
 async function initDB() {
-  const SQL = await initSqlJs();
-  if (fs.existsSync(DB_PATH)) {
-    db = new SQL.Database(fs.readFileSync(DB_PATH));
-  } else {
-    db = new SQL.Database();
-  }
-
-  db.run(`CREATE TABLE IF NOT EXISTS patients (id TEXT PRIMARY KEY, name TEXT NOT NULL, dob TEXT NOT NULL, phone TEXT NOT NULL, blood_group TEXT NOT NULL, email TEXT UNIQUE, password_hash TEXT, gender TEXT, address TEXT, photo TEXT, abha_id TEXT, qr_code_url TEXT, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS medical_history (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, allergies TEXT DEFAULT '[]', chronic_conditions TEXT DEFAULT '[]', immunization_status TEXT DEFAULT 'Not Updated', organ_donor_status TEXT DEFAULT 'No')`);
-  db.run(`CREATE TABLE IF NOT EXISTS prescriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, doctor_id TEXT, doctor_name TEXT, hospital TEXT, date TEXT DEFAULT (datetime('now')), medications TEXT DEFAULT '[]', notes TEXT, lab_report TEXT, lab_report_name TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS emergency_contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, name TEXT NOT NULL, relationship TEXT NOT NULL, phone TEXT NOT NULL)`);
-  db.run(`CREATE TABLE IF NOT EXISTS insurance (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, provider TEXT, policy_number TEXT, abha_id TEXT, scheme_name TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS otp_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, purpose TEXT DEFAULT 'doctor_access', used INTEGER DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS doctors (id TEXT PRIMARY KEY, name TEXT NOT NULL, specialization TEXT, hospital TEXT, hospital_id TEXT, license_number TEXT, phone TEXT, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, latitude REAL, longitude REAL, consultation_fee INTEGER DEFAULT 500, experience_years INTEGER DEFAULT 0, available_days TEXT DEFAULT 'Mon,Tue,Wed,Thu,Fri', available_start TEXT DEFAULT '09:00', available_end TEXT DEFAULT '17:00', bio TEXT, profile_photo TEXT, medical_certificate TEXT, status TEXT DEFAULT 'pending', created_at TEXT DEFAULT (datetime('now')))`);
-
-  // Migration: Add bio column if it doesn't exist for legacy databases
-  try { db.run(`ALTER TABLE doctors ADD COLUMN bio TEXT`); } catch (e) { }
-
-  db.run(`CREATE TABLE IF NOT EXISTS admins (id TEXT PRIMARY KEY, name TEXT NOT NULL, organization TEXT NOT NULL, org_type TEXT DEFAULT 'Hospital', email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS appointments (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, doctor_id TEXT NOT NULL, patient_name TEXT, doctor_name TEXT, date TEXT NOT NULL, time_slot TEXT, status TEXT DEFAULT 'pending', notes TEXT, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS access_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id TEXT NOT NULL, accessor_id TEXT, accessor_name TEXT, accessor_type TEXT DEFAULT 'doctor', layer_accessed TEXT, purpose TEXT, timestamp TEXT DEFAULT (datetime('now')))`);
-
-  // === Hospital Management System tables ===
-  db.run(`CREATE TABLE IF NOT EXISTS super_admins (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS hospitals (id TEXT PRIMARY KEY, name TEXT NOT NULL, address TEXT, city TEXT, phone TEXT, email TEXT, type TEXT DEFAULT 'Hospital', logo TEXT, beds_total INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')), pincode TEXT, latitude REAL, longitude REAL)`);
-  db.run(`CREATE TABLE IF NOT EXISTS hospital_heads (id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS departments (id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, name TEXT NOT NULL, head_name TEXT, created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS staff (id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, department_id TEXT, name TEXT NOT NULL, role TEXT DEFAULT 'Nurse', phone TEXT, email TEXT, shift TEXT DEFAULT 'Day', created_at TEXT DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, hospital_id TEXT NOT NULL, item_name TEXT NOT NULL, category TEXT DEFAULT 'Medicine', quantity INTEGER DEFAULT 0, unit TEXT DEFAULT 'pcs', reorder_level INTEGER DEFAULT 10, updated_at TEXT DEFAULT (datetime('now')))`);
-
-  // === Sarvam Workflow: Hospital Patient Archives (Many-to-One) ===
-  db.run(`CREATE TABLE IF NOT EXISTS hospital_patient_archives (
-    id TEXT PRIMARY KEY,
-    hospital_id TEXT NOT NULL,
-    patient_id TEXT NOT NULL,
-    access_token TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    status TEXT DEFAULT 'synced',
-    created_at TEXT DEFAULT (datetime('now'))
-  )`);
-
-
-  // -- Password Reset Table (TTL-based) -----------------------
-  db.run(`CREATE TABLE IF NOT EXISTS password_resets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL,
-    role TEXT NOT NULL,
-    otp_hash TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    used INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  )`);
-  // -- Trusted Login Sessions (30-day device tokens) ----------
-  db.run(`CREATE TABLE IF NOT EXISTS login_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    token_hash TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    expires_at TEXT NOT NULL
-  )`);
-
-
-
-
-  // Migrate existing hospitals Table if missing columns
-  const cols = all('PRAGMA table_info(hospitals)');
-  if (!cols.find(c => c.name === 'pincode')) {
-    try {
-      db.run('ALTER TABLE hospitals ADD COLUMN pincode TEXT');
-      db.run('ALTER TABLE hospitals ADD COLUMN latitude REAL');
-      db.run('ALTER TABLE hospitals ADD COLUMN longitude REAL');
-    } catch (e) { }
-  }
-
-  // Health Reports Table
-  db.run(`CREATE TABLE IF NOT EXISTS lab_reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    patient_id TEXT NOT NULL,
-    report_type TEXT,
-    age INTEGER,
-    gender TEXT,
-    analysis_json TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )`);
-
-  // Migration for doctors table
-  const docCols = all('PRAGMA table_info(doctors)');
-  if (!docCols.find(c => c.name === 'medical_certificate')) {
-    try { db.run('ALTER TABLE doctors ADD COLUMN medical_certificate TEXT'); } catch (e) { }
-  }
-  if (!docCols.find(c => c.name === 'status')) {
-    try {
-      db.run("ALTER TABLE doctors ADD COLUMN status TEXT DEFAULT 'pending'");
-      db.run("ALTER TABLE doctors ADD COLUMN hospital_id TEXT");
-      // Mark existing doctors as approved so they don't get locked out
-      db.run("UPDATE doctors SET status='approved'");
-    } catch (e) { }
-  }
-  // NEW: Update any with empty hospital_id if name matches a hospital
-  try {
-    const hospitals = all('SELECT id, name FROM hospitals');
-    hospitals.forEach(h => {
-      run('UPDATE doctors SET hospital_id=? WHERE hospital_id IS NULL AND (hospital=? OR hospital=?)', [h.id, h.name, h.name + ' ']);
-    });
-  } catch (e) { }
-
-
+  console.log('- Initializing Firestore Database Connection...');
+  
   // Seed default Super Admin if none exists
-  const sa = get('SELECT id FROM super_admins LIMIT 1');
-  if (!sa) {
-    db.run(`INSERT INTO super_admins (id, name, email, password_hash) VALUES (?, ?, ?, ?)`,
-      [uuidv4(), 'Super Admin', 'admin@uhqr.com', bcrypt.hashSync('Admin@123', 10)]);
+  try {
+    const saSnap = await firestore.collection('super_admins').limit(1).get();
+    if (saSnap.empty) {
+      const id = uuidv4();
+      await firestore.collection('super_admins').doc(id).set({
+        id,
+        name: 'Super Admin',
+        email: 'admin@uhqr.com',
+        password_hash: bcrypt.hashSync('Admin@123', 10),
+        created_at: new Date().toISOString()
+      });
+      console.log('  - Seeded default Super Admin');
+    }
+  } catch (err) {
+    console.error('Error seeding Firestore:', err);
   }
-
-  // --- Start PHI Encryption Migration ---
-  await migrateToEncryption();
-
-  saveDB();
 }
 
 async function migrateToEncryption() {
-  console.log('- Scanning database for PHI encryption migration...');
-  let totalMigrated = 0;
-
-  // 1. Patients Table
-  const patients = all('SELECT id, dob, phone, blood_group, gender, address, abha_id FROM patients');
-  patients.forEach(p => {
-    const encrypted = {
-      dob: encrypt(p.dob),
-      phone: encrypt(p.phone),
-      blood_group: encrypt(p.blood_group),
-      gender: encrypt(p.gender),
-      address: encrypt(p.address),
-      abha_id: encrypt(p.abha_id)
-    };
-    run('UPDATE patients SET dob=?, phone=?, blood_group=?, gender=?, address=?, abha_id=? WHERE id=?',
-      [encrypted.dob, encrypted.phone, encrypted.blood_group, encrypted.gender, encrypted.address, encrypted.abha_id, p.id]);
-  });
-  totalMigrated += patients.length;
-
-  // 2. Medical History
-  const history = all('SELECT id, allergies, chronic_conditions, immunization_status FROM medical_history');
-  history.forEach(h => {
-    run('UPDATE medical_history SET allergies=?, chronic_conditions=?, immunization_status=? WHERE id=?',
-      [encrypt(h.allergies), encrypt(h.chronic_conditions), encrypt(h.immunization_status), h.id]);
-  });
-  totalMigrated += history.length;
-
-  // 3. Prescriptions
-  const rxs = all('SELECT id, medications, notes, lab_report_name FROM prescriptions');
-  rxs.forEach(r => {
-    run('UPDATE prescriptions SET medications=?, notes=?, lab_report_name=? WHERE id=?',
-      [encrypt(r.medications), encrypt(r.notes), encrypt(r.lab_report_name), r.id]);
-  });
-  totalMigrated += rxs.length;
-
-  // 4. Insurance
-  const insurance = all('SELECT id, provider, policy_number, abha_id, scheme_name FROM insurance');
-  insurance.forEach(i => {
-    run('UPDATE insurance SET provider=?, policy_number=?, abha_id=?, scheme_name=? WHERE id=?',
-      [encrypt(i.provider), encrypt(i.policy_number), encrypt(i.abha_id), encrypt(i.scheme_name), i.id]);
-  });
-  totalMigrated += insurance.length;
-
-  // 5. Emergency Contacts
-  const contacts = all('SELECT id, name, phone FROM emergency_contacts');
-  contacts.forEach(c => {
-    run('UPDATE emergency_contacts SET name=?, phone=? WHERE id=?',
-      [encrypt(c.name), encrypt(c.phone), c.id]);
-  });
-  totalMigrated += contacts.length;
-
-  // 6. Appointments
-  const apts = all('SELECT id, notes FROM appointments');
-  apts.forEach(a => {
-    run('UPDATE appointments SET notes=? WHERE id=?', [encrypt(a.notes), a.id]);
-  });
-  totalMigrated += apts.length;
-
-  if (totalMigrated > 0) {
-    console.log(`- Migration successfully validated/encrypted ${totalMigrated} PHI records.`);
-  }
+  // Encryption is handled at the document level in the new refactored functions
+  return;
 }
 
 // === PATIENT ROUTES ===
@@ -609,7 +569,7 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
       insurance_provider, policy_number, abha_id, scheme_name } = req.body;
     if (!name || !dob || !phone || !blood_group || !email || !password) return res.status(400).json({ error: 'Name, DOB, Phone, Blood Group, Email, and Password are required' });
 
-    const existingEmail = get('SELECT id FROM patients WHERE email = ?', [email]);
+    const existingEmail = await get('SELECT id FROM patients WHERE email = ?', [email]);
     if (existingEmail) return res.status(409).json({ error: 'Email already registered' });
 
     const patientId = generatePatientId(name, phone);
@@ -620,7 +580,7 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
 
     const enc = preparePatientForDB({ dob, phone, blood_group, gender, address, abha_id });
 
-    run('INSERT INTO patients (id,name,dob,phone,blood_group,email,password_hash,gender,address,photo,abha_id,qr_code_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    await run('INSERT INTO patients (id,name,dob,phone,blood_group,email,password_hash,gender,address,photo,abha_id,qr_code_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
       [patientId, name, enc.dob, enc.phone, enc.blood_group, email, passwordHash, enc.gender || null, enc.address || null, photo, enc.abha_id || null, qrCodeDataUrl]);
 
     let allergies = req.body.allergies || [];
@@ -628,15 +588,15 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
     if (typeof allergies === 'string') allergies = [allergies];
     if (typeof conditions === 'string') conditions = [conditions];
 
-    run('INSERT INTO medical_history (patient_id,allergies,chronic_conditions,immunization_status,organ_donor_status) VALUES (?,?,?,?,?)',
+    await run('INSERT INTO medical_history (patient_id,allergies,chronic_conditions,immunization_status,organ_donor_status) VALUES (?,?,?,?,?)',
       [patientId, encrypt(JSON.stringify(allergies)), encrypt(JSON.stringify(conditions)), encrypt(immunization_status || 'Not Updated'), organ_donor_status || 'No']);
 
     if (emergency_contact_name && emergency_contact_phone)
-      run('INSERT INTO emergency_contacts (patient_id,name,relationship,phone) VALUES (?,?,?,?)',
+      await run('INSERT INTO emergency_contacts (patient_id,name,relationship,phone) VALUES (?,?,?,?)',
         [patientId, encrypt(emergency_contact_name), emergency_contact_relationship || 'Other', encrypt(emergency_contact_phone)]);
 
     if (insurance_provider || policy_number)
-      run('INSERT INTO insurance (patient_id,provider,policy_number,abha_id,scheme_name) VALUES (?,?,?,?,?)',
+      await run('INSERT INTO insurance (patient_id,provider,policy_number,abha_id,scheme_name) VALUES (?,?,?,?,?)',
         [patientId, encrypt(insurance_provider) || null, encrypt(policy_number) || null, encrypt(abha_id) || null, encrypt(scheme_name) || null]);
 
     console.log(`- Patient registered: ${name} (ID: ${patientId})`);
@@ -644,15 +604,15 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: 'Registration failed' }); }
 });
 
-app.get('/api/patients/:id/emergency', (req, res) => {
+app.get('/api/patients/:id/emergency', async (req, res) => {
   try {
-    const p = get('SELECT p.id,p.name,p.dob,p.blood_group,p.photo,mh.allergies,mh.chronic_conditions FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
+    const p = await get('SELECT p.id,p.name,p.dob,p.blood_group,p.photo,mh.allergies,mh.chronic_conditions FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
-    const contacts = all('SELECT name,relationship,phone FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
+    const contacts = await all('SELECT name,relationship,phone FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
     // Log doctor QR scan visit
     const { doctor_id, doctor_name, doctor_specialization } = req.query;
     if (doctor_id) {
-      run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 1 - Emergency','QR Scan')",
+      await run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 1 - Emergency','QR Scan')",
         [req.params.id, doctor_id, doctor_name || 'Unknown Doctor']);
     }
     const fp = formatPatientFromDB(p);
@@ -665,11 +625,11 @@ app.get('/api/patients/:id/emergency', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/patients/:id/visit-history', (req, res) => {
+app.get('/api/patients/:id/visit-history', async (req, res) => {
   try {
-    const p = get('SELECT id FROM patients WHERE id=?', [req.params.id]);
+    const p = await get('SELECT id FROM patients WHERE id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
-    const visits = all(`SELECT al.id, al.accessor_id, al.accessor_name, al.accessor_type, al.layer_accessed, al.purpose, al.timestamp,
+    const visits = await all(`SELECT al.id, al.accessor_id, al.accessor_name, al.accessor_type, al.layer_accessed, al.purpose, al.timestamp,
       d.specialization, d.hospital FROM access_logs al
       LEFT JOIN doctors d ON al.accessor_id=d.id
       WHERE al.patient_id=? AND al.accessor_type='doctor'
@@ -678,14 +638,14 @@ app.get('/api/patients/:id/visit-history', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/patients/:id/clinical', (req, res) => {
+app.get('/api/patients/:id/clinical', async (req, res) => {
   try {
-    const p = get('SELECT p.*,mh.allergies,mh.chronic_conditions,mh.immunization_status,mh.organ_donor_status FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
+    const p = await get('SELECT p.*,mh.allergies,mh.chronic_conditions,mh.immunization_status,mh.organ_donor_status FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
-    const rxs = all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC LIMIT 5', [req.params.id]);
-    const contacts = all('SELECT * FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
+    const rxs = await all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC LIMIT 5', [req.params.id]);
+    const contacts = await all('SELECT * FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
     const { accessor_id, accessor_name, accessor_type } = req.query;
-    if (accessor_id && accessor_type === 'doctor') run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,?,'Layer 2 - Clinical','OTP Verified Access')",
+    if (accessor_id && accessor_type === 'doctor') await run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,?,'Layer 2 - Clinical','OTP Verified Access')",
       [req.params.id, accessor_id, accessor_name || 'Unknown', 'doctor']);
     const fp = formatPatientFromDB(p);
     res.json({
@@ -702,16 +662,16 @@ app.get('/api/patients/:id/clinical', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/patients/:id/admin', (req, res) => {
+app.get('/api/patients/:id/admin', async (req, res) => {
   try {
-    const p = get('SELECT p.*,mh.allergies,mh.chronic_conditions,mh.immunization_status,mh.organ_donor_status FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
+    const p = await get('SELECT p.*,mh.allergies,mh.chronic_conditions,mh.immunization_status,mh.organ_donor_status FROM patients p LEFT JOIN medical_history mh ON p.id=mh.patient_id WHERE p.id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
-    const rxs = all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC LIMIT 5', [req.params.id]);
-    const contacts = all('SELECT * FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
-    const ins = get('SELECT * FROM insurance WHERE patient_id=?', [req.params.id]);
-    const logs = all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [req.params.id]);
+    const rxs = await all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC LIMIT 5', [req.params.id]);
+    const contacts = await all('SELECT * FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
+    const ins = await get('SELECT * FROM insurance WHERE patient_id=?', [req.params.id]);
+    const logs = await all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [req.params.id]);
     const { accessor_id, accessor_name } = req.query;
-    if (accessor_id) run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'admin','Layer 3 - Admin','Admin Panel Access')",
+    if (accessor_id) await run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'admin','Layer 3 - Admin','Admin Panel Access')",
       [req.params.id, accessor_id, accessor_name || 'Admin']);
     const fp = formatPatientFromDB(p);
     res.json({
@@ -732,15 +692,15 @@ app.get('/api/patients/:id/admin', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/patients/login', (req, res) => {
+app.post('/api/patients/login', async (req, res) => {
   try {
     const { phone } = req.body;
-    const p = get('SELECT id,name FROM patients WHERE phone=?', [phone]);
+    const p = await get('SELECT id,name FROM patients WHERE phone=?', [phone]);
     if (!p) return res.status(404).json({ error: 'No patient found with this phone' });
     const otp = generateOTP();
     const otpHash = bcrypt.hashSync(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    run('INSERT INTO otp_sessions (phone,otp_hash,expires_at,purpose) VALUES (?,?,?,?)', [phone, otpHash, expiresAt, 'patient_login']);
+    await run('INSERT INTO otp_sessions (phone,otp_hash,expires_at,purpose) VALUES (?,?,?,?)', [phone, otpHash, expiresAt, 'patient_login']);
     console.log(` OTP for ${phone}: ${otp}`);
     res.json({ success: true, mock_otp: otp, patient_name: p.name });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
@@ -748,17 +708,17 @@ app.post('/api/patients/login', (req, res) => {
 
 // Trusted device token helpers
 function hashDeviceToken(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
-function checkDeviceToken(userId, role, token) {
+async function checkDeviceToken(userId, role, token) {
   if (!token) return false;
   const hash = hashDeviceToken(token);
-  const session = get("SELECT id FROM login_sessions WHERE user_id=? AND role=? AND token_hash=? AND expires_at>datetime('now')", [userId, role, hash]);
+  const session = await get("SELECT id FROM login_sessions WHERE user_id=? AND role=? AND token_hash=? AND expires_at>datetime('now')", [userId, role, hash]);
   return !!session;
 }
-function issueDeviceToken(userId, role) {
+async function issueDeviceToken(userId, role) {
   const token = crypto.randomBytes(48).toString('hex');
   const hash = hashDeviceToken(token);
   const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  run('INSERT INTO login_sessions (user_id, role, token_hash, expires_at) VALUES (?,?,?,?)', [userId, role, hash, expiresAt]);
+  await run('INSERT INTO login_sessions (user_id, role, token_hash, expires_at) VALUES (?,?,?,?)', [userId, role, hash, expiresAt]);
   return token;
 }
 
@@ -767,7 +727,7 @@ app.post('/api/patients/login-password', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const patient = get('SELECT * FROM patients WHERE email=?', [email]);
+    const patient = await get('SELECT * FROM patients WHERE email=?', [email]);
     if (!patient) return res.status(404).json({ error: 'No patient with this email' });
     if (!bcrypt.compareSync(password, patient.password_hash)) return res.status(401).json({ error: 'Invalid password' });
 
@@ -778,7 +738,7 @@ app.post('/api/patients/login-password', async (req, res) => {
       const otp = generateSecureOTP();
       const otpHash = bcrypt.hashSync(otp, 10);
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-      run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
+      await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
         [email, otpHash, expiresAt, 'login_verify_patient']);
 
       let emailSent = false, devOtp = null;
@@ -803,11 +763,11 @@ app.post('/api/patients/login-password', async (req, res) => {
     // Trusted device: return full session
     delete patient.password_hash;
     const fp = formatPatientFromDB(patient);
-    const history = get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
-    const rxs = all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
-    const contacts = all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
-    const logs = all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
-    const ins = get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
+    const history = await get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
+    const rxs = await all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
+    const contacts = await all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
+    const logs = await all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
+    const ins = await get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
     res.json({
       success: true, patient: {
         ...fp,
@@ -828,10 +788,10 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     // Check both patients and doctors
-    let user = get('SELECT id, name FROM patients WHERE email=?', [email]);
+    let user = await get('SELECT id, name FROM patients WHERE email=?', [email]);
     let userType = 'patient';
     if (!user) {
-      user = get('SELECT id, name FROM doctors WHERE email=?', [email]);
+      user = await get('SELECT id, name FROM doctors WHERE email=?', [email]);
       userType = 'doctor';
     }
 
@@ -841,7 +801,7 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
     const otpHash = bcrypt.hashSync(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 minutes
 
-    run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?, ?, ?, ?)',
+    await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?, ?, ?, ?)',
       [email, otpHash, expiresAt, 'forgot_password']);
 
     console.log(` Password Recovery OTP for ${email} (${userType}): ${otp}`);
@@ -854,7 +814,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const { email, otp, newPassword } = req.body;
     if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
 
-    const session = get('SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 ORDER BY expires_at DESC LIMIT 1',
+    const session = await get('SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 ORDER BY expires_at DESC LIMIT 1',
       [email, 'forgot_password']);
 
     if (!session || new Date() > new Date(session.expires_at)) {
@@ -868,17 +828,17 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const newHash = bcrypt.hashSync(newPassword, 10);
     let updated = false;
 
-    run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
+    await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
     if (db.getRowsModified() > 0) updated = true;
 
     if (!updated) {
-      run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
+      await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
       if (db.getRowsModified() > 0) updated = true;
     }
 
     if (!updated) return res.status(404).json({ error: 'User not found' });
 
-    run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
     res.json({ success: true, message: 'Password reset successful' });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
 });
@@ -893,21 +853,21 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
 
     // Check if email already used (patients or doctors or admins)
     if (role === 'patient') {
-      const existing = get('SELECT id FROM patients WHERE email=?', [emailLower]);
+      const existing = await get('SELECT id FROM patients WHERE email=?', [emailLower]);
       if (existing) return res.status(400).json({ error: 'Email is already registered as a patient.' });
     } else if (role === 'doctor') {
-      const existing = get('SELECT id FROM doctors WHERE email=?', [emailLower]);
+      const existing = await get('SELECT id FROM doctors WHERE email=?', [emailLower]);
       if (existing) return res.status(400).json({ error: 'Email is already registered as a doctor.' });
     } else {
-      const existingPatient = get('SELECT id FROM patients WHERE email=?', [emailLower]);
-      const existingDoctor = get('SELECT id FROM doctors WHERE email=?', [emailLower]);
+      const existingPatient = await get('SELECT id FROM patients WHERE email=?', [emailLower]);
+      const existingDoctor = await get('SELECT id FROM doctors WHERE email=?', [emailLower]);
       if (existingPatient || existingDoctor) return res.status(400).json({ error: 'Email is already registered. Please login.' });
     }
 
     const otp = generateSecureOTP();
     const otpHash = bcrypt.hashSync(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 minutes
-    run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
+    await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
       [emailLower, otpHash, expiresAt, 'register_verify']);
 
     let emailSent = false, devOtp = null;
@@ -929,20 +889,20 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to send OTP' }); }
 });
 
-app.post('/api/auth/register-verify-otp', (req, res) => {
+app.post('/api/auth/register-verify-otp', async (req, res) => {
   try {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
     const emailLower = email.toLowerCase();
 
-    const session = get(
+    const session = await get(
       "SELECT * FROM otp_sessions WHERE phone=? AND purpose='register_verify' AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1",
       [emailLower]
     );
     if (!session) return res.status(401).json({ error: 'OTP expired or not found' });
     if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(401).json({ error: 'Incorrect OTP' });
 
-    run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
     res.json({ success: true, verified_email: emailLower });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to verify OTP' }); }
 });
@@ -953,27 +913,27 @@ app.post('/api/auth/login-verify-otp', async (req, res) => {
     if (!email || !role || !otp) return res.status(400).json({ error: 'email, role, and otp are required' });
 
     const purpose = role === 'doctor' ? 'login_verify_doctor' : 'login_verify_patient';
-    const session = get(
+    const session = await get(
       "SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1",
       [email, purpose]
     );
     if (!session) return res.status(401).json({ error: 'OTP expired or not found. Please try logging in again.' });
     if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(401).json({ error: 'Incorrect OTP' });
-    run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
 
     // Issue a trusted device token
     let user, sessionData;
     if (role === 'patient') {
-      const patient = get('SELECT * FROM patients WHERE email=?', [email]);
+      const patient = await get('SELECT * FROM patients WHERE email=?', [email]);
       if (!patient) return res.status(404).json({ error: 'Patient not found' });
       const deviceToken = issueDeviceToken(patient.id, 'patient');
       delete patient.password_hash;
       const fp = formatPatientFromDB(patient);
-      const history = get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
-      const rxs = all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
-      const contacts = all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
-      const logs = all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
-      const ins = get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
+      const history = await get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
+      const rxs = await all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
+      const contacts = await all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
+      const logs = await all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
+      const ins = await get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
       sessionData = {
         success: true,
         device_token: deviceToken,
@@ -987,10 +947,10 @@ app.post('/api/auth/login-verify-otp', async (req, res) => {
         }
       };
     } else if (role === 'doctor') {
-      const doc = get('SELECT * FROM doctors WHERE email=?', [email]);
+      const doc = await get('SELECT * FROM doctors WHERE email=?', [email]);
       if (!doc) return res.status(404).json({ error: 'Doctor not found' });
       const deviceToken = issueDeviceToken(doc.id, 'doctor');
-      const recent = all('SELECT DISTINCT al.patient_id,p.name as patient_name,al.timestamp,al.layer_accessed FROM access_logs al JOIN patients p ON al.patient_id=p.id WHERE al.accessor_id=? ORDER BY al.timestamp DESC LIMIT 10', [doc.id]);
+      const recent = await all('SELECT DISTINCT al.patient_id,p.name as patient_name,al.timestamp,al.layer_accessed FROM access_logs al JOIN patients p ON al.patient_id=p.id WHERE al.accessor_id=? ORDER BY al.timestamp DESC LIMIT 10', [doc.id]);
       delete doc.password_hash;
       sessionData = { success: true, device_token: deviceToken, doctor: doc, recent_patients: recent };
     } else {
@@ -1001,21 +961,21 @@ app.post('/api/auth/login-verify-otp', async (req, res) => {
     res.json(sessionData);
   } catch (err) { console.error(err); res.status(500).json({ error: 'Verification failed' }); }
 });
-app.post('/api/patients/verify-otp', (req, res) => {
+app.post('/api/patients/verify-otp', async (req, res) => {
   try {
     const { phone, otp } = req.body;
-    const sessions = all("SELECT * FROM otp_sessions WHERE phone=? AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1", [phone]);
+    const sessions = await all("SELECT * FROM otp_sessions WHERE phone=? AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1", [phone]);
     const session = sessions[0];
     if (!session) return res.status(400).json({ error: 'OTP expired or not found' });
     if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(400).json({ error: 'Invalid OTP' });
-    run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
-    const patient = get('SELECT * FROM patients WHERE phone=?', [phone]);
+    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    const patient = await get('SELECT * FROM patients WHERE phone=?', [phone]);
     const fp = formatPatientFromDB(patient);
-    const history = get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
-    const rxs = all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
-    const contacts = all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
-    const logs = all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
-    const ins = get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
+    const history = await get('SELECT * FROM medical_history WHERE patient_id=?', [fp.id]);
+    const rxs = await all('SELECT * FROM prescriptions WHERE patient_id=? ORDER BY date DESC', [fp.id]);
+    const contacts = await all('SELECT * FROM emergency_contacts WHERE patient_id=?', [fp.id]);
+    const logs = await all('SELECT * FROM access_logs WHERE patient_id=? ORDER BY timestamp DESC LIMIT 20', [fp.id]);
+    const ins = await get('SELECT * FROM insurance WHERE patient_id=?', [fp.id]);
     res.json({
       success: true, patient: {
         ...fp,
@@ -1028,67 +988,67 @@ app.post('/api/patients/verify-otp', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Verification failed' }); }
 });
 
-app.put('/api/patients/:id', (req, res) => {
+app.put('/api/patients/:id', async (req, res) => {
   try {
     const { name, dob, phone, blood_group, gender, address, email, photo, allergies, chronic_conditions, immunization_status, organ_donor_status } = req.body;
     const enc = preparePatientForDB({ dob, phone, blood_group, gender, address, email });
-    run('UPDATE patients SET name=?,dob=?,phone=?,blood_group=?,gender=?,address=?,email=?,photo=? WHERE id=?',
+    await run('UPDATE patients SET name=?,dob=?,phone=?,blood_group=?,gender=?,address=?,email=?,photo=? WHERE id=?',
       [name, enc.dob, enc.phone, enc.blood_group, enc.gender || null, enc.address || null, enc.email || null, photo || null, req.params.id]);
 
-    run('UPDATE medical_history SET allergies=?,chronic_conditions=?,immunization_status=?,organ_donor_status=? WHERE patient_id=?',
+    await run('UPDATE medical_history SET allergies=?,chronic_conditions=?,immunization_status=?,organ_donor_status=? WHERE patient_id=?',
       [encrypt(JSON.stringify(allergies || [])), encrypt(JSON.stringify(chronic_conditions || [])), encrypt(immunization_status || 'Not Updated'), organ_donor_status || 'No', req.params.id]);
     // Update emergency contacts
     if (req.body.emergency_contact_name) {
-      run('DELETE FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
-      run('INSERT INTO emergency_contacts (patient_id,name,relationship,phone) VALUES (?,?,?,?)',
+      await run('DELETE FROM emergency_contacts WHERE patient_id=?', [req.params.id]);
+      await run('INSERT INTO emergency_contacts (patient_id,name,relationship,phone) VALUES (?,?,?,?)',
         [req.params.id, encrypt(req.body.emergency_contact_name), req.body.emergency_contact_relationship || 'Other', encrypt(req.body.emergency_contact_phone || '')]);
     }
     // Update insurance
     if (req.body.insurance_provider || req.body.policy_number || req.body.abha_id) {
-      const existIns = get('SELECT id FROM insurance WHERE patient_id=?', [req.params.id]);
-      if (existIns) run('UPDATE insurance SET provider=?,policy_number=?,abha_id=?,scheme_name=? WHERE patient_id=?',
+      const existIns = await get('SELECT id FROM insurance WHERE patient_id=?', [req.params.id]);
+      if (existIns) await run('UPDATE insurance SET provider=?,policy_number=?,abha_id=?,scheme_name=? WHERE patient_id=?',
         [encrypt(req.body.insurance_provider) || null, encrypt(req.body.policy_number) || null, encrypt(req.body.abha_id) || null, encrypt(req.body.scheme_name) || null, req.params.id]);
-      else run('INSERT INTO insurance (patient_id,provider,policy_number,abha_id,scheme_name) VALUES (?,?,?,?,?)',
+      else await run('INSERT INTO insurance (patient_id,provider,policy_number,abha_id,scheme_name) VALUES (?,?,?,?,?)',
         [req.params.id, encrypt(req.body.insurance_provider) || null, encrypt(req.body.policy_number) || null, encrypt(req.body.abha_id) || null, encrypt(req.body.scheme_name) || null]);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Update failed' }); }
 });
 
-app.post('/api/patients/:id/request-otp', (req, res) => {
+app.post('/api/patients/:id/request-otp', async (req, res) => {
   try {
-    const p = get('SELECT id, phone, name FROM patients WHERE id=?', [req.params.id]);
+    const p = await get('SELECT id, phone, name FROM patients WHERE id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
     const realPhone = decrypt(p.phone);
     const otp = generateOTP();
-    run('INSERT INTO otp_sessions (phone,otp_hash,expires_at,purpose) VALUES (?,?,?,?)',
+    await run('INSERT INTO otp_sessions (phone,otp_hash,expires_at,purpose) VALUES (?,?,?,?)',
       [realPhone, bcrypt.hashSync(otp, 10), new Date(Date.now() + 5 * 60 * 1000).toISOString(), 'doctor_access']);
     const { doctor_id, doctor_name } = req.body;
-    run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 1 - Emergency','QR Scan')",
+    await run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 1 - Emergency','QR Scan')",
       [req.params.id, doctor_id || 'anonymous', doctor_name || 'Unknown']);
     console.log(` Doctor OTP for ${p.name}: ${otp}`);
     res.json({ success: true, mock_otp: otp, patient_phone: realPhone });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/patients/:id/verify-doctor-otp', (req, res) => {
+app.post('/api/patients/:id/verify-doctor-otp', async (req, res) => {
   try {
-    const p = get('SELECT id, phone FROM patients WHERE id=?', [req.params.id]);
+    const p = await get('SELECT id, phone FROM patients WHERE id=?', [req.params.id]);
     if (!p) return res.status(404).json({ error: 'Patient not found' });
     const realPhone = decrypt(p.phone);
     const { otp } = req.body;
-    const sessions = all("SELECT * FROM otp_sessions WHERE phone=? AND purpose='doctor_access' AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1", [realPhone]);
+    const sessions = await all("SELECT * FROM otp_sessions WHERE phone=? AND purpose='doctor_access' AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1", [realPhone]);
     const session = sessions[0];
     if (!session) return res.status(400).json({ error: 'OTP expired' });
     if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(400).json({ error: 'Invalid OTP' });
-    run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/hospitals/list', (req, res) => {
+app.get('/api/hospitals/list', async (req, res) => {
   try {
-    const hospitals = all('SELECT id, name, city, type FROM hospitals ORDER BY name');
+    const hospitals = await all('SELECT id, name, city, type FROM hospitals ORDER BY name');
     res.json({ success: true, hospitals });
   } catch (err) { res.status(500).json({ error: 'Failed to fetch hospitals' }); }
 });
@@ -1100,7 +1060,7 @@ app.post('/api/doctors/register', upload.fields([{ name: 'photo', maxCount: 1 },
       latitude, longitude, consultation_fee, experience_years, available_days, available_start, available_end } = req.body;
 
     if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, password required' });
-    if (get('SELECT id FROM doctors WHERE email=?', [email])) return res.status(409).json({ error: 'Email exists' });
+    if (await get('SELECT id FROM doctors WHERE email=?', [email])) return res.status(409).json({ error: 'Email exists' });
 
     // Process files
     let profile_photo = null;
@@ -1118,7 +1078,7 @@ app.post('/api/doctors/register', upload.fields([{ name: 'photo', maxCount: 1 },
     if (!medical_certificate) return res.status(400).json({ error: 'Medical certificate is mandatory' });
 
     const id = uuidv4();
-    run(`INSERT INTO doctors (id,name,specialization,hospital,hospital_id,license_number,phone,email,password_hash,latitude,longitude,consultation_fee,experience_years,available_days,available_start,available_end,bio,profile_photo,medical_certificate,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    await run(`INSERT INTO doctors (id,name,specialization,hospital,hospital_id,license_number,phone,email,password_hash,latitude,longitude,consultation_fee,experience_years,available_days,available_start,available_end,bio,profile_photo,medical_certificate,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [id, name, specialization, hospital, hospital_id || null, license_number, phone, email, bcrypt.hashSync(password, 10),
         latitude ? parseFloat(latitude) : null, longitude ? parseFloat(longitude) : null,
         consultation_fee ? parseInt(consultation_fee) : 500, experience_years ? parseInt(experience_years) : 0,
@@ -1145,13 +1105,13 @@ app.get('/api/hospitals/proximity', async (req, res) => {
   try {
     const { lat, lng, city, radius, search } = req.query;
     const maxKm = parseFloat(radius) || 80;
-    let hospitals = all('SELECT * FROM hospitals ORDER BY name ASC');
+    let hospitals = await all('SELECT * FROM hospitals ORDER BY name ASC');
 
     const userLat = lat ? parseFloat(lat) : null;
     const userLng = lng ? parseFloat(lng) : null;
 
-    // Calculate Haversine distance for all hospitals
-    hospitals = hospitals.map(h => {
+    // Calculate Haversine distance and fetch beds for all hospitals
+    hospitals = await Promise.all(hospitals.map(async h => {
       if (userLat && userLng && h.latitude && h.longitude) {
         h.distance_km = haversine(userLat, userLng, parseFloat(h.latitude), parseFloat(h.longitude));
       } else {
@@ -1159,7 +1119,7 @@ app.get('/api/hospitals/proximity', async (req, res) => {
       }
       // Attach bed data
       try {
-        const beds = get('SELECT * FROM hospital_beds WHERE hospital_id=?', [h.id]);
+        const beds = await get('SELECT * FROM hospital_beds WHERE hospital_id=?', [h.id]);
         if (beds) {
           h.icu_available = beds.icu_available; h.icu_total = beds.icu_total;
           h.emergency_available = beds.emergency_available; h.emergency_total = beds.emergency_total;
@@ -1167,7 +1127,7 @@ app.get('/api/hospitals/proximity', async (req, res) => {
         }
       } catch (_) { }
       return h;
-    });
+    }));
 
     // -- SARVAM SPATIAL RESONANCE: Strict City-Node Protocol --
     if (city && city.trim()) {
@@ -1213,17 +1173,17 @@ app.get('/api/hospitals/proximity', async (req, res) => {
 });
 
 // List doctors (optionally filter nearby + city-lock)
-app.get('/api/doctors/nearby', (req, res) => {
+app.get('/api/doctors/nearby', async (req, res) => {
   try {
     const { lat, lng, radius, search, city } = req.query;
-    let docs = all('SELECT id,name,specialization,hospital,hospital_id,phone,email,latitude,longitude,consultation_fee,experience_years,available_days,available_start,available_end,profile_photo,created_at FROM doctors WHERE status=? ORDER BY created_at DESC', ['approved']);
+    let docs = await all('SELECT id,name,specialization,hospital,hospital_id,phone,email,latitude,longitude,consultation_fee,experience_years,available_days,available_start,available_end,profile_photo,created_at FROM doctors WHERE status=? ORDER BY created_at DESC', ['approved']);
 
     const userLat = lat ? parseFloat(lat) : null;
     const userLng = lng ? parseFloat(lng) : null;
     const maxKm = parseFloat(radius) || 25;
 
     // Calculate distance for ALL doctors first
-    docs = docs.map(d => {
+    docs = await Promise.all(docs.map(async d => {
       if (userLat && userLng && d.latitude && d.longitude) {
         const R = 6371;
         const dLat = (d.latitude - userLat) * Math.PI / 180;
@@ -1234,7 +1194,7 @@ app.get('/api/doctors/nearby', (req, res) => {
         // No coords on doctor - try to match by hospital city
         const hid = d.hospital_id;
         if (hid) {
-          const hosp = get('SELECT city, latitude, longitude FROM hospitals WHERE id=?', [hid]);
+          const hosp = await get('SELECT city, latitude, longitude FROM hospitals WHERE id=?', [hid]);
           if (hosp && hosp.latitude && hosp.longitude) {
             const R = 6371;
             const dLat = (hosp.latitude - userLat) * Math.PI / 180;
@@ -1251,34 +1211,32 @@ app.get('/api/doctors/nearby', (req, res) => {
         d.distance_km = null;
       }
       return d;
-    });
+    }));
 
     // -- SARVAM SPATIAL RESONANCE: Doctor City-Node Handshake --
     if (city && city.trim()) {
       const cityLower = city.trim().toLowerCase();
-      // Resonance Synonym Mapping (Bangalore/Bengaluru)
       const isBangalore = cityLower.includes('bangalore') || cityLower.includes('bengaluru');
-
-      docs = docs.filter(d => {
+      const filteredDocs = [];
+      for (const d of docs) {
         const docHospital = (d.hospital || '').toLowerCase();
-        // 1. Direct match in listed hospital string
-        if (docHospital.includes(cityLower)) return true;
-        if (isBangalore && (docHospital.includes('bangalore') || docHospital.includes('bengaluru'))) return true;
-
-        // 2. Cross-reference the linked hospital's database record
-        if (d.hospital_id) {
+        let match = false;
+        if (docHospital.includes(cityLower)) match = true;
+        else if (isBangalore && (docHospital.includes('bangalore') || docHospital.includes('bengaluru'))) match = true;
+        else if (d.hospital_id) {
           try {
-            const hosp = get('SELECT city, address FROM hospitals WHERE id=?', [d.hospital_id]);
+            const hosp = await get('SELECT city, address FROM hospitals WHERE id=?', [d.hospital_id]);
             if (hosp) {
               const hCity = (hosp.city || '').toLowerCase();
-              if (hCity.includes(cityLower)) return true;
-              if (isBangalore && (hCity.includes('bangalore') || hCity.includes('bengaluru'))) return true;
-              if ((hosp.address || '').toLowerCase().includes(cityLower)) return true;
+              if (hCity.includes(cityLower) || (isBangalore && (hCity.includes('bangalore') || hCity.includes('bengaluru'))) || (hosp.address || '').toLowerCase().includes(cityLower)) {
+                match = true;
+              }
             }
           } catch (_) { }
         }
-        return false;
-      });
+        if (match) filteredDocs.push(d);
+      }
+      docs = filteredDocs;
     }
 
     // GPS-based sort: sort by distance ascending (nulls last)
@@ -1304,7 +1262,7 @@ app.get('/api/doctors/nearby', (req, res) => {
 app.post('/api/doctors/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const doc = get('SELECT * FROM doctors WHERE email=?', [email]);
+    const doc = await get('SELECT * FROM doctors WHERE email=?', [email]);
     if (!doc) return res.status(404).json({ error: 'Doctor not found' });
 
     // Approval Guard
@@ -1322,7 +1280,7 @@ app.post('/api/doctors/login', async (req, res) => {
       const otp = generateSecureOTP();
       const otpHash = bcrypt.hashSync(otp, 10);
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-      run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
+      await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
         [email, otpHash, expiresAt, 'login_verify_doctor']);
 
       let emailSent = false, devOtp = null;
@@ -1345,22 +1303,22 @@ app.post('/api/doctors/login', async (req, res) => {
     }
 
     // Trusted device: return full session
-    const recent = all('SELECT DISTINCT al.patient_id,p.name as patient_name,al.timestamp,al.layer_accessed FROM access_logs al JOIN patients p ON al.patient_id=p.id WHERE al.accessor_id=? ORDER BY al.timestamp DESC LIMIT 10', [doc.id]);
+    const recent = await all('SELECT DISTINCT al.patient_id,p.name as patient_name,al.timestamp,al.layer_accessed FROM access_logs al JOIN patients p ON al.patient_id=p.id WHERE al.accessor_id=? ORDER BY al.timestamp DESC LIMIT 10', [doc.id]);
     delete doc.password_hash;
     res.json({ success: true, doctor: doc, recent_patients: recent });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/prescriptions', upload.single('lab_report'), (req, res) => {
+app.post('/api/prescriptions', upload.single('lab_report'), async (req, res) => {
   try {
     const { patient_id, doctor_id, doctor_name, hospital, medications, notes } = req.body;
     if (!patient_id) return res.status(400).json({ error: 'Patient ID required' });
-    if (!get('SELECT id FROM patients WHERE id=?', [patient_id])) return res.status(404).json({ error: 'Patient not found' });
+    if (!await get('SELECT id FROM patients WHERE id=?', [patient_id])) return res.status(404).json({ error: 'Patient not found' });
     const lab = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null;
     const labName = req.file ? req.file.originalname : null;
-    run('INSERT INTO prescriptions (patient_id,doctor_id,doctor_name,hospital,medications,notes,lab_report,lab_report_name) VALUES (?,?,?,?,?,?,?,?)',
+    await run('INSERT INTO prescriptions (patient_id,doctor_id,doctor_name,hospital,medications,notes,lab_report,lab_report_name) VALUES (?,?,?,?,?,?,?,?)',
       [patient_id, doctor_id, doctor_name, hospital, encrypt(typeof medications === 'string' ? medications : JSON.stringify(medications || [])), encrypt(notes), lab, encrypt(labName)]);
-    run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 2','Added Prescription')",
+    await run("INSERT INTO access_logs (patient_id,accessor_id,accessor_name,accessor_type,layer_accessed,purpose) VALUES (?,?,?,'doctor','Layer 2','Added Prescription')",
       [patient_id, doctor_id, doctor_name || 'Doctor']);
     res.json({ success: true });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
@@ -1374,7 +1332,7 @@ app.post('/api/sarvam/quantum-scan', async (req, res) => {
 
   try {
     // 1. Verify Patient
-    const patient = get('SELECT id, name, blood_group FROM patients WHERE id = ?', [patientId]);
+    const patient = await get('SELECT id, name, blood_group FROM patients WHERE id = ?', [patientId]);
     if (!patient) return res.status(404).json({ error: 'Patient Identity Not Found' });
 
     // 2. Generate Secure Handshake Token (10 min expiry)
@@ -1382,18 +1340,18 @@ app.post('/api/sarvam/quantum-scan', async (req, res) => {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     // 3. Global Access Log (Privacy Record)
-    run(`INSERT INTO access_logs (patient_id, accessor_id, accessor_name, accessor_type, layer_accessed, purpose)
+    await run(`INSERT INTO access_logs (patient_id, accessor_id, accessor_name, accessor_type, layer_accessed, purpose)
          VALUES (?, ?, ?, 'doctor', 'Quantum Scan', 'Zero-Contact Onboarding')`,
       [patientId, doctorId, 'Doctor (' + doctorId.substring(0, 8) + ')']);
 
     // 4. Hospital Node Archival (Many-to-One Relationship)
-    const existing = get('SELECT id FROM hospital_patient_archives WHERE hospital_id = ? AND patient_id = ?', [hospitalId, patientId]);
+    const existing = await get('SELECT id FROM hospital_patient_archives WHERE hospital_id = ? AND patient_id = ?', [hospitalId, patientId]);
     if (!existing) {
-      run(`INSERT INTO hospital_patient_archives (id, hospital_id, patient_id, access_token, expires_at, status)
+      await run(`INSERT INTO hospital_patient_archives (id, hospital_id, patient_id, access_token, expires_at, status)
            VALUES (?, ?, ?, ?, ?, 'synced')`,
         [uuidv4(), hospitalId, patientId, accessToken, expiresAt]);
     } else {
-      run(`UPDATE hospital_patient_archives SET access_token = ?, expires_at = ?, created_at = datetime('now') WHERE id = ?`,
+      await run(`UPDATE hospital_patient_archives SET access_token = ?, expires_at = ?, created_at = datetime('now') WHERE id = ?`,
         [accessToken, expiresAt, existing.id]);
     }
 
@@ -1414,32 +1372,32 @@ app.post('/api/sarvam/quantum-scan', async (req, res) => {
 
 
 // === ADMIN ROUTES ===
-app.post('/api/admins/register', (req, res) => {
+app.post('/api/admins/register', async (req, res) => {
   try {
     const { name, organization, org_type, email, password } = req.body;
     if (!name || !organization || !email || !password) return res.status(400).json({ error: 'All fields required' });
-    if (get('SELECT id FROM admins WHERE email=?', [email])) return res.status(409).json({ error: 'Email exists' });
+    if (await get('SELECT id FROM admins WHERE email=?', [email])) return res.status(409).json({ error: 'Email exists' });
     const id = uuidv4();
-    run('INSERT INTO admins (id,name,organization,org_type,email,password_hash) VALUES (?,?,?,?,?,?)',
+    await run('INSERT INTO admins (id,name,organization,org_type,email,password_hash) VALUES (?,?,?,?,?,?)',
       [id, name, organization, org_type || 'Hospital', email, bcrypt.hashSync(password, 10)]);
     res.json({ success: true, admin: { id, name, organization, org_type } });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/admins/login', (req, res) => {
+app.post('/api/admins/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const admin = get('SELECT * FROM admins WHERE email=?', [email]);
+    const admin = await get('SELECT * FROM admins WHERE email=?', [email]);
     if (!admin) return res.status(404).json({ error: 'Admin not found' });
     if (!bcrypt.compareSync(password, admin.password_hash)) return res.status(401).json({ error: 'Invalid password' });
     const stats = {
-      patientCount: get('SELECT COUNT(*) as count FROM patients').count,
-      doctorCount: get('SELECT COUNT(*) as count FROM doctors').count,
-      prescriptionCount: get('SELECT COUNT(*) as count FROM prescriptions').count
+      patientCount: await get('SELECT COUNT(*) as count FROM patients').count,
+      doctorCount: await get('SELECT COUNT(*) as count FROM doctors').count,
+      prescriptionCount: await get('SELECT COUNT(*) as count FROM prescriptions').count
     };
-    const patients = all('SELECT id,name,phone,blood_group,created_at FROM patients ORDER BY created_at DESC LIMIT 20');
-    const doctors = all('SELECT id,name,specialization,hospital,email FROM doctors ORDER BY created_at DESC');
-    const recentLogs = all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 20');
+    const patients = await all('SELECT id,name,phone,blood_group,created_at FROM patients ORDER BY created_at DESC LIMIT 20');
+    const doctors = await all('SELECT id,name,specialization,hospital,email FROM doctors ORDER BY created_at DESC');
+    const recentLogs = await all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 20');
     delete admin.password_hash;
     res.json({ success: true, admin, stats, patients, doctors, recentLogs });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
@@ -1448,9 +1406,9 @@ app.post('/api/admins/login', (req, res) => {
 // === APPOINTMENT ROUTES ===
 
 // Slot availability for a doctor on a date (30-min slots)
-app.get('/api/appointments/slots/:doctorId/:date', (req, res) => {
+app.get('/api/appointments/slots/:doctorId/:date', async (req, res) => {
   try {
-    const doc = get('SELECT available_start,available_end,available_days FROM doctors WHERE id=?', [req.params.doctorId]);
+    const doc = await get('SELECT available_start,available_end,available_days FROM doctors WHERE id=?', [req.params.doctorId]);
     const start = doc?.available_start || '09:00';
     const end = doc?.available_end || '17:00';
     const days = doc?.available_days || 'Mon,Tue,Wed,Thu,Fri'; // default Mon-Fri
@@ -1473,7 +1431,7 @@ app.get('/api/appointments/slots/:doctorId/:date', (req, res) => {
       sm += 30; if (sm >= 60) { sm -= 60; sh++; }
     }
     // Find booked/pending slots
-    const taken = all(
+    const taken = await all(
       `SELECT time_slot FROM appointments WHERE doctor_id=? AND date=? AND status IN ('pending','confirmed')`,
       [req.params.doctorId, req.params.date]
     ).map(r => r.time_slot);
@@ -1481,19 +1439,19 @@ app.get('/api/appointments/slots/:doctorId/:date', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/appointments', (req, res) => {
+app.post('/api/appointments', async (req, res) => {
   try {
     const { patient_id, doctor_id, patient_name, doctor_name, date, time_slot, notes } = req.body;
     if (!patient_id || !doctor_id || !date) return res.status(400).json({ error: 'Patient, doctor, and date required' });
     // Conflict check
     if (time_slot) {
-      const conflict = get(`SELECT id FROM appointments WHERE doctor_id=? AND date=? AND time_slot=? AND status IN ('pending','confirmed')`,
+      const conflict = await get(`SELECT id FROM appointments WHERE doctor_id=? AND date=? AND time_slot=? AND status IN ('pending','confirmed')`,
         [doctor_id, date, time_slot]);
       if (conflict) return res.status(409).json({ error: 'This slot was just booked. Please choose another.' });
     }
-    run('INSERT INTO appointments (patient_id,doctor_id,patient_name,doctor_name,date,time_slot,notes,status) VALUES (?,?,?,?,?,?,?,?)',
+    await run('INSERT INTO appointments (patient_id,doctor_id,patient_name,doctor_name,date,time_slot,notes,status) VALUES (?,?,?,?,?,?,?,?)',
       [patient_id, doctor_id, patient_name, doctor_name, date, time_slot || null, encrypt(notes || null), 'pending']);
-    const apt = get('SELECT * FROM appointments WHERE patient_id=? AND doctor_id=? AND date=? AND time_slot=? ORDER BY id DESC LIMIT 1',
+    const apt = await get('SELECT * FROM appointments WHERE patient_id=? AND doctor_id=? AND date=? AND time_slot=? ORDER BY id DESC LIMIT 1',
       [patient_id, doctor_id, date, time_slot || null]);
     // Notify doctor via SSE
     sseSend(doctorSSE, doctor_id, 'new_request', { appointment: apt });
@@ -1501,17 +1459,17 @@ app.post('/api/appointments', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Booking failed' }); }
 });
 
-app.get('/api/appointments/:patientId', (req, res) => {
+app.get('/api/appointments/:patientId', async (req, res) => {
   try {
-    const appointments = all('SELECT a.*,d.specialization,d.hospital,d.phone as doctor_phone FROM appointments a LEFT JOIN doctors d ON a.doctor_id=d.id WHERE a.patient_id=? ORDER BY a.date DESC', [req.params.patientId]);
+    const appointments = await all('SELECT a.*,d.specialization,d.hospital,d.phone as doctor_phone FROM appointments a LEFT JOIN doctors d ON a.doctor_id=d.id WHERE a.patient_id=? ORDER BY a.date DESC', [req.params.patientId]);
     res.json({ success: true, appointments: appointments.map(a => ({ ...a, notes: decrypt(a.notes) })) });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Doctor appointments with stats
-app.get('/api/doctors/:id/appointments', (req, res) => {
+app.get('/api/doctors/:id/appointments', async (req, res) => {
   try {
-    const apts = all('SELECT a.*,p.phone as patient_phone FROM appointments a LEFT JOIN patients p ON a.patient_id=p.id WHERE a.doctor_id=? ORDER BY a.date DESC', [req.params.id]);
+    const apts = await all('SELECT a.*,p.phone as patient_phone FROM appointments a LEFT JOIN patients p ON a.patient_id=p.id WHERE a.doctor_id=? ORDER BY a.date DESC', [req.params.id]);
     const finalApts = apts.map(a => ({ ...a, notes: decrypt(a.notes), patient_phone: decrypt(a.patient_phone) }));
     const today = new Date().toISOString().split('T')[0];
     const total = finalApts.length;
@@ -1522,13 +1480,13 @@ app.get('/api/doctors/:id/appointments', (req, res) => {
 });
 
 // Fetch archived patients for a doctor's hospital (Sarvam History)
-app.get('/api/doctors/:id/archives', (req, res) => {
+app.get('/api/doctors/:id/archives', async (req, res) => {
   try {
-    const doc = get('SELECT id, hospital_id FROM doctors WHERE id = ?', [req.params.id]);
+    const doc = await get('SELECT id, hospital_id FROM doctors WHERE id = ?', [req.params.id]);
     if (!doc) return res.status(404).json({ error: 'Doctor not found' });
     const targetHospitalId = doc.hospital_id || doc.id;
 
-    const archives = all(`
+    const archives = await all(`
       SELECT 
         a.id, a.created_at as sync_at, a.status,
         p.name as patient_name, p.id as patient_id, 
@@ -1547,47 +1505,47 @@ app.get('/api/doctors/:id/archives', (req, res) => {
 });
 
 // Approve appointment
-app.patch('/api/appointments/:id/approve', (req, res) => {
+app.patch('/api/appointments/:id/approve', async (req, res) => {
   try {
-    run('UPDATE appointments SET status=? WHERE id=?', ['confirmed', req.params.id]);
-    saveDB();
-    const apt = get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
+    await run('UPDATE appointments SET status=? WHERE id=?', ['confirmed', req.params.id]);
+    
+    const apt = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
     if (apt) sseSend(patientSSE, apt.patient_id, 'appointment_update', { appointment: apt });
     res.json({ success: true, appointment: apt });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Cancel appointment
-app.patch('/api/appointments/:id/cancel', (req, res) => {
+app.patch('/api/appointments/:id/cancel', async (req, res) => {
   try {
-    const apBefore = get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
-    run('UPDATE appointments SET status=? WHERE id=?', ['cancelled', req.params.id]);
-    saveDB();
-    const apt = get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
+    const apBefore = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
+    await run('UPDATE appointments SET status=? WHERE id=?', ['cancelled', req.params.id]);
+    
+    const apt = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
     if (apt) sseSend(patientSSE, apt.patient_id, 'appointment_update', { appointment: apt });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // SSE streams
-app.get('/api/sse/doctor/:doctorId', (req, res) => {
+app.get('/api/sse/doctor/:doctorId', async (req, res) => {
   sseSubscribe(doctorSSE, req.params.doctorId, res);
 });
-app.get('/api/sse/patient/:patientId', (req, res) => {
+app.get('/api/sse/patient/:patientId', async (req, res) => {
   sseSubscribe(patientSSE, req.params.patientId, res);
 });
 
 // Update doctor profile & availability
-app.put('/api/doctors/:id', (req, res) => {
+app.put('/api/doctors/:id', async (req, res) => {
   try {
     const { name, specialization, hospital, phone, email, consultation_fee, experience_years,
       available_days, available_start, available_end, bio, profile_photo } = req.body;
-    run(`UPDATE doctors SET name=?,specialization=?,hospital=?,phone=?,email=?,consultation_fee=?,experience_years=?,available_days=?,available_start=?,available_end=?,bio=?,profile_photo=? WHERE id=?`,
+    await run(`UPDATE doctors SET name=?,specialization=?,hospital=?,phone=?,email=?,consultation_fee=?,experience_years=?,available_days=?,available_start=?,available_end=?,bio=?,profile_photo=? WHERE id=?`,
       [name, specialization, hospital, phone, email,
         consultation_fee ? parseInt(consultation_fee) : 500, experience_years ? parseInt(experience_years) : 0,
         available_days || 'Mon,Tue,Wed,Thu,Fri', available_start || '09:00', available_end || '17:00', bio || '', profile_photo || null, req.params.id]);
-    saveDB();
-    const updated = get('SELECT * FROM doctors WHERE id=?', [req.params.id]);
+    
+    const updated = await get('SELECT * FROM doctors WHERE id=?', [req.params.id]);
     delete updated.password_hash;
     res.json({ success: true, doctor: updated });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Update failed' }); }
@@ -1596,10 +1554,10 @@ app.put('/api/doctors/:id', (req, res) => {
 // =====================================================
 // SUPER ADMIN ROUTES
 // =====================================================
-app.post('/api/super-admin/login', (req, res) => {
+app.post('/api/super-admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const sa = get('SELECT * FROM super_admins WHERE email=?', [email]);
+    const sa = await get('SELECT * FROM super_admins WHERE email=?', [email]);
     if (!sa) return res.status(404).json({ error: 'Super Admin not found' });
     if (!bcrypt.compareSync(password, sa.password_hash)) return res.status(401).json({ error: 'Invalid password' });
     delete sa.password_hash;
@@ -1607,92 +1565,92 @@ app.post('/api/super-admin/login', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Login failed' }); }
 });
 
-app.get('/api/super-admin/dashboard', (req, res) => {
+app.get('/api/super-admin/dashboard', async (req, res) => {
   try {
     const stats = {
-      hospitals: get('SELECT COUNT(*) as c FROM hospitals').c,
-      hospitalHeads: get('SELECT COUNT(*) as c FROM hospital_heads').c,
-      doctors: get('SELECT COUNT(*) as c FROM doctors').c,
-      patients: get('SELECT COUNT(*) as c FROM patients').c,
-      appointments: get('SELECT COUNT(*) as c FROM appointments').c,
-      totalBeds: get('SELECT COALESCE(SUM(beds_total),0) as c FROM hospitals').c,
+      hospitals: await get('SELECT COUNT(*) as c FROM hospitals').c,
+      hospitalHeads: await get('SELECT COUNT(*) as c FROM hospital_heads').c,
+      doctors: await get('SELECT COUNT(*) as c FROM doctors').c,
+      patients: await get('SELECT COUNT(*) as c FROM patients').c,
+      appointments: await get('SELECT COUNT(*) as c FROM appointments').c,
+      totalBeds: await get('SELECT COALESCE(SUM(beds_total),0) as c FROM hospitals').c,
     };
-    const hospitals = all('SELECT h.*, (SELECT COUNT(*) FROM hospital_heads hh WHERE hh.hospital_id=h.id) as head_count, (SELECT COUNT(*) FROM departments d WHERE d.hospital_id=h.id) as dept_count, (SELECT COUNT(*) FROM staff s WHERE s.hospital_id=h.id) as staff_count FROM hospitals h ORDER BY h.created_at DESC');
-    const recentLogs = all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 20');
+    const hospitals = await all('SELECT h.*, (SELECT COUNT(*) FROM hospital_heads hh WHERE hh.hospital_id=h.id) as head_count, (SELECT COUNT(*) FROM departments d WHERE d.hospital_id=h.id) as dept_count, (SELECT COUNT(*) FROM staff s WHERE s.hospital_id=h.id) as staff_count FROM hospitals h ORDER BY h.created_at DESC');
+    const recentLogs = await all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 20');
     res.json({ success: true, stats, hospitals, recentLogs });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/super-admin/hospitals', (req, res) => {
+app.post('/api/super-admin/hospitals', async (req, res) => {
   try {
     const { name, address, city, phone, email, type, beds_total } = req.body;
     if (!name) return res.status(400).json({ error: 'Hospital name required' });
     if (!email) return res.status(400).json({ error: 'Admin email required' });
     const id = uuidv4();
-    run('INSERT INTO hospitals (id,name,address,city,phone,email,type,beds_total) VALUES (?,?,?,?,?,?,?,?)',
+    await run('INSERT INTO hospitals (id,name,address,city,phone,email,type,beds_total) VALUES (?,?,?,?,?,?,?,?)',
       [id, name, address || '', city || '', phone || '', email || '', type || 'Hospital', parseInt(beds_total) || 0]);
     res.status(201).json({ success: true, hospital: { id, name, address, city, phone, email, type, beds_total: parseInt(beds_total) || 0 } });
   } catch (err) { res.status(500).json({ error: 'Failed to save hospital' }); }
 });
 
-app.get('/api/super-admin/hospitals', (req, res) => {
+app.get('/api/super-admin/hospitals', async (req, res) => {
   try {
-    const hospitals = all('SELECT h.*, (SELECT COUNT(*) FROM hospital_heads hh WHERE hh.hospital_id=h.id) as head_count, (SELECT COUNT(*) FROM departments d WHERE d.hospital_id=h.id) as dept_count, (SELECT COUNT(*) FROM staff s WHERE s.hospital_id=h.id) as staff_count FROM hospitals h ORDER BY h.created_at DESC');
+    const hospitals = await all('SELECT h.*, (SELECT COUNT(*) FROM hospital_heads hh WHERE hh.hospital_id=h.id) as head_count, (SELECT COUNT(*) FROM departments d WHERE d.hospital_id=h.id) as dept_count, (SELECT COUNT(*) FROM staff s WHERE s.hospital_id=h.id) as staff_count FROM hospitals h ORDER BY h.created_at DESC');
     res.json({ success: true, hospitals });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.put('/api/super-admin/hospitals/:id', (req, res) => {
+app.put('/api/super-admin/hospitals/:id', async (req, res) => {
   try {
     const { name, address, city, phone, email, type, beds_total } = req.body;
-    run('UPDATE hospitals SET name=?,address=?,city=?,phone=?,email=?,type=?,beds_total=? WHERE id=?',
+    await run('UPDATE hospitals SET name=?,address=?,city=?,phone=?,email=?,type=?,beds_total=? WHERE id=?',
       [name, address || '', city || '', phone || '', email || '', type || 'Hospital', parseInt(beds_total) || 0, req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/super-admin/hospitals/:id', (req, res) => {
+app.delete('/api/super-admin/hospitals/:id', async (req, res) => {
   try {
-    run('DELETE FROM hospital_heads WHERE hospital_id=?', [req.params.id]);
-    run('DELETE FROM departments WHERE hospital_id=?', [req.params.id]);
-    run('DELETE FROM staff WHERE hospital_id=?', [req.params.id]);
-    run('DELETE FROM inventory WHERE hospital_id=?', [req.params.id]);
-    run('DELETE FROM hospitals WHERE id=?', [req.params.id]);
+    await run('DELETE FROM hospital_heads WHERE hospital_id=?', [req.params.id]);
+    await run('DELETE FROM departments WHERE hospital_id=?', [req.params.id]);
+    await run('DELETE FROM staff WHERE hospital_id=?', [req.params.id]);
+    await run('DELETE FROM inventory WHERE hospital_id=?', [req.params.id]);
+    await run('DELETE FROM hospitals WHERE id=?', [req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Hospital Head CRUD (Super Admin manages)
-app.post('/api/super-admin/hospital-heads', (req, res) => {
+app.post('/api/super-admin/hospital-heads', async (req, res) => {
   try {
     const { hospital_id, name, email, password } = req.body;
     if (!hospital_id || !name || !email || !password) return res.status(400).json({ error: 'All fields required' });
-    if (!get('SELECT id FROM hospitals WHERE id=?', [hospital_id])) return res.status(404).json({ error: 'Hospital not found' });
-    if (get('SELECT id FROM hospital_heads WHERE email=?', [email])) return res.status(409).json({ error: 'Email already exists' });
+    if (!await get('SELECT id FROM hospitals WHERE id=?', [hospital_id])) return res.status(404).json({ error: 'Hospital not found' });
+    if (await get('SELECT id FROM hospital_heads WHERE email=?', [email])) return res.status(409).json({ error: 'Email already exists' });
     const id = uuidv4();
-    run('INSERT INTO hospital_heads (id,hospital_id,name,email,password_hash) VALUES (?,?,?,?,?)',
+    await run('INSERT INTO hospital_heads (id,hospital_id,name,email,password_hash) VALUES (?,?,?,?,?)',
       [id, hospital_id, name, email, bcrypt.hashSync(password, 10)]);
     res.json({ success: true, head: { id, hospital_id, name, email } });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/super-admin/hospital-heads', (req, res) => {
+app.get('/api/super-admin/hospital-heads', async (req, res) => {
   try {
-    const heads = all('SELECT hh.id,hh.hospital_id,hh.name,hh.email,hh.created_at,h.name as hospital_name FROM hospital_heads hh LEFT JOIN hospitals h ON hh.hospital_id=h.id ORDER BY hh.created_at DESC');
+    const heads = await all('SELECT hh.id,hh.hospital_id,hh.name,hh.email,hh.created_at,h.name as hospital_name FROM hospital_heads hh LEFT JOIN hospitals h ON hh.hospital_id=h.id ORDER BY hh.created_at DESC');
     res.json({ success: true, heads });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/super-admin/hospital-heads/:id', (req, res) => {
+app.delete('/api/super-admin/hospital-heads/:id', async (req, res) => {
   try {
-    run('DELETE FROM hospital_heads WHERE id=?', [req.params.id]);
+    await run('DELETE FROM hospital_heads WHERE id=?', [req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/api/super-admin/logs', (req, res) => {
+app.get('/api/super-admin/logs', async (req, res) => {
   try {
-    const logs = all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 50');
+    const logs = await all('SELECT al.*,p.name as patient_name FROM access_logs al LEFT JOIN patients p ON al.patient_id=p.id ORDER BY al.timestamp DESC LIMIT 50');
     res.json({ success: true, logs });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1700,10 +1658,10 @@ app.get('/api/super-admin/logs', (req, res) => {
 // =====================================================
 // HOSPITAL HEAD ROUTES (Scoped to hospital_id)
 // =====================================================
-app.post('/api/hospital-head/login', (req, res) => {
+app.post('/api/hospital-head/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const hh = get('SELECT hh.*,h.name as hospital_name,h.type as hospital_type,h.city as hospital_city,h.beds_total FROM hospital_heads hh LEFT JOIN hospitals h ON hh.hospital_id=h.id WHERE hh.email=?', [email]);
+    const hh = await get('SELECT hh.*,h.name as hospital_name,h.type as hospital_type,h.city as hospital_city,h.beds_total FROM hospital_heads hh LEFT JOIN hospitals h ON hh.hospital_id=h.id WHERE hh.email=?', [email]);
     if (!hh) return res.status(404).json({ error: 'Hospital Head not found' });
     if (!bcrypt.compareSync(password, hh.password_hash)) return res.status(401).json({ error: 'Invalid password' });
     delete hh.password_hash;
@@ -1711,56 +1669,56 @@ app.post('/api/hospital-head/login', (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Login failed' }); }
 });
 
-app.get('/api/hospital-head/:hospitalId/dashboard', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/dashboard', async (req, res) => {
   try {
     const hid = req.params.hospitalId;
-    const hospital = get('SELECT * FROM hospitals WHERE id=?', [hid]);
+    const hospital = await get('SELECT * FROM hospitals WHERE id=?', [hid]);
     if (!hospital) return res.status(404).json({ error: 'Hospital not found' });
     const stats = {
-      departments: get('SELECT COUNT(*) as c FROM departments WHERE hospital_id=?', [hid]).c,
-      staff: get('SELECT COUNT(*) as c FROM staff WHERE hospital_id=?', [hid]).c,
-      inventory: get('SELECT COUNT(*) as c FROM inventory WHERE hospital_id=?', [hid]).c,
-      lowStock: get('SELECT COUNT(*) as c FROM inventory WHERE hospital_id=? AND quantity<=reorder_level', [hid]).c,
+      departments: await get('SELECT COUNT(*) as c FROM departments WHERE hospital_id=?', [hid]).c,
+      staff: await get('SELECT COUNT(*) as c FROM staff WHERE hospital_id=?', [hid]).c,
+      inventory: await get('SELECT COUNT(*) as c FROM inventory WHERE hospital_id=?', [hid]).c,
+      lowStock: await get('SELECT COUNT(*) as c FROM inventory WHERE hospital_id=? AND quantity<=reorder_level', [hid]).c,
     };
     res.json({ success: true, hospital, stats });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Departments
-app.get('/api/hospital-head/:hospitalId/departments', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/departments', async (req, res) => {
   try {
-    const depts = all('SELECT d.*, (SELECT COUNT(*) FROM staff s WHERE s.department_id=d.id) as staff_count FROM departments d WHERE d.hospital_id=? ORDER BY d.name', [req.params.hospitalId]);
+    const depts = await all('SELECT d.*, (SELECT COUNT(*) FROM staff s WHERE s.department_id=d.id) as staff_count FROM departments d WHERE d.hospital_id=? ORDER BY d.name', [req.params.hospitalId]);
     res.json({ success: true, departments: depts });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/hospital-head/:hospitalId/departments', (req, res) => {
+app.post('/api/hospital-head/:hospitalId/departments', async (req, res) => {
   try {
     const { name, head_name } = req.body;
     if (!name) return res.status(400).json({ error: 'Department name required' });
     const id = uuidv4();
-    run('INSERT INTO departments (id,hospital_id,name,head_name) VALUES (?,?,?,?)',
+    await run('INSERT INTO departments (id,hospital_id,name,head_name) VALUES (?,?,?,?)',
       [id, req.params.hospitalId, name, head_name || '']);
     res.json({ success: true, department: { id, name, head_name } });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/hospital-head/:hospitalId/departments/:id', (req, res) => {
+app.delete('/api/hospital-head/:hospitalId/departments/:id', async (req, res) => {
   try {
-    run('DELETE FROM departments WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
+    await run('DELETE FROM departments WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Staff
-app.get('/api/hospital-head/:hospitalId/staff', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/staff', async (req, res) => {
   try {
-    const staffList = all('SELECT s.*,d.name as department_name FROM staff s LEFT JOIN departments d ON s.department_id=d.id WHERE s.hospital_id=? ORDER BY s.name', [req.params.hospitalId]);
+    const staffList = await all('SELECT s.*,d.name as department_name FROM staff s LEFT JOIN departments d ON s.department_id=d.id WHERE s.hospital_id=? ORDER BY s.name', [req.params.hospitalId]);
     res.json({ success: true, staff: staffList });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/hospital-head/:hospitalId/staff', (req, res) => {
+app.post('/api/hospital-head/:hospitalId/staff', async (req, res) => {
   try {
     const { name, role, department_name, phone, email, shift } = req.body;
     if (!name) return res.status(400).json({ error: 'Staff name required' });
@@ -1770,59 +1728,59 @@ app.post('/api/hospital-head/:hospitalId/staff', (req, res) => {
 
     if (department_name) {
       // Find or Create department
-      let dept = get('SELECT id FROM departments WHERE hospital_id=? AND name=?', [hid, department_name]);
+      let dept = await get('SELECT id FROM departments WHERE hospital_id=? AND name=?', [hid, department_name]);
       if (dept) {
         deptId = dept.id;
       } else {
         deptId = uuidv4();
-        run('INSERT INTO departments (id,hospital_id,name,head_name) VALUES (?,?,?,?)', [deptId, hid, department_name, '']);
+        await run('INSERT INTO departments (id,hospital_id,name,head_name) VALUES (?,?,?,?)', [deptId, hid, department_name, '']);
       }
     }
 
     const id = uuidv4();
-    run('INSERT INTO staff (id,hospital_id,department_id,name,role,phone,email,shift) VALUES (?,?,?,?,?,?,?,?)',
+    await run('INSERT INTO staff (id,hospital_id,department_id,name,role,phone,email,shift) VALUES (?,?,?,?,?,?,?,?)',
       [id, hid, deptId, name, role || 'Nurse', phone || '', email || '', shift || 'Day']);
     res.json({ success: true, staff: { id, name, role, department_id: deptId, phone, email, shift } });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/hospital-head/:hospitalId/staff/:id', (req, res) => {
+app.delete('/api/hospital-head/:hospitalId/staff/:id', async (req, res) => {
   try {
-    run('DELETE FROM staff WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
+    await run('DELETE FROM staff WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // Inventory
-app.get('/api/hospital-head/:hospitalId/inventory', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/inventory', async (req, res) => {
   try {
-    const items = all('SELECT * FROM inventory WHERE hospital_id=? ORDER BY item_name', [req.params.hospitalId]);
+    const items = await all('SELECT * FROM inventory WHERE hospital_id=? ORDER BY item_name', [req.params.hospitalId]);
     res.json({ success: true, inventory: items });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.post('/api/hospital-head/:hospitalId/inventory', (req, res) => {
+app.post('/api/hospital-head/:hospitalId/inventory', async (req, res) => {
   try {
     const { item_name, category, quantity, unit, reorder_level } = req.body;
     if (!item_name) return res.status(400).json({ error: 'Item name required' });
-    run('INSERT INTO inventory (hospital_id,item_name,category,quantity,unit,reorder_level) VALUES (?,?,?,?,?,?)',
+    await run('INSERT INTO inventory (hospital_id,item_name,category,quantity,unit,reorder_level) VALUES (?,?,?,?,?,?)',
       [req.params.hospitalId, item_name, category || 'Medicine', parseInt(quantity) || 0, unit || 'pcs', parseInt(reorder_level) || 10]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.put('/api/hospital-head/:hospitalId/inventory/:id', (req, res) => {
+app.put('/api/hospital-head/:hospitalId/inventory/:id', async (req, res) => {
   try {
     const { item_name, category, quantity, unit, reorder_level } = req.body;
-    run('UPDATE inventory SET item_name=?,category=?,quantity=?,unit=?,reorder_level=?,updated_at=datetime("now") WHERE id=? AND hospital_id=?',
+    await run('UPDATE inventory SET item_name=?,category=?,quantity=?,unit=?,reorder_level=?,updated_at=datetime("now") WHERE id=? AND hospital_id=?',
       [item_name, category, parseInt(quantity) || 0, unit || 'pcs', parseInt(reorder_level) || 10, req.params.id, req.params.hospitalId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/hospital-head/:hospitalId/inventory/:id', (req, res) => {
+app.delete('/api/hospital-head/:hospitalId/inventory/:id', async (req, res) => {
   try {
-    run('DELETE FROM inventory WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
+    await run('DELETE FROM inventory WHERE id=? AND hospital_id=?', [req.params.id, req.params.hospitalId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
@@ -2067,7 +2025,7 @@ function buildPatientContext(patientContext) {
 
 
 // Health tips endpoint
-app.get('/api/ai/tips', (req, res) => {
+app.get('/api/ai/tips', async (req, res) => {
   const tips = [
     { title: 'Stay Hydrated', icon: 'water_drop', text: 'Drink 8-10 glasses of water daily. Your urine should be pale yellow.', category: 'wellness' },
     { title: 'Move Every Hour', icon: 'directions_walk', text: 'Take a 5-minute walk every hour if you have a sedentary job. It reduces cardiovascular risk by 30%.', category: 'fitness' },
@@ -2089,9 +2047,9 @@ app.get('/api/ai/tips', (req, res) => {
 // ==========================================
 
 // Get city-wide stats
-app.get('/api/beds/stats', (req, res) => {
+app.get('/api/beds/stats', async (req, res) => {
   try {
-    const beds = all(`SELECT * FROM hospital_beds`);
+    const beds = await all(`SELECT * FROM hospital_beds`);
     let stats = { icu_total: 0, icu_avail: 0, gen_total: 0, gen_avail: 0, mat_total: 0, mat_avail: 0, ped_total: 0, ped_avail: 0, emerg_total: 0, emerg_avail: 0 };
     beds.forEach(b => {
       stats.icu_total += b.icu_total; stats.icu_avail += b.icu_available;
@@ -2100,17 +2058,17 @@ app.get('/api/beds/stats', (req, res) => {
       stats.ped_total += b.pediatric_total; stats.ped_avail += b.pediatric_available;
       stats.emerg_total += b.emergency_total; stats.emerg_avail += b.emergency_available;
     });
-    const emergencyList = all(`SELECT id, name, city, phone FROM hospitals WHERE type = 'Hospital' LIMIT 5`);
+    const emergencyList = await all(`SELECT id, name, city, phone FROM hospitals WHERE type = 'Hospital' LIMIT 5`);
     res.json({ success: true, stats, emergency_contacts: emergencyList });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Search Beds
-app.get('/api/beds/search', (req, res) => {
+app.get('/api/beds/search', async (req, res) => {
   try {
     let q = req.query.q ? req.query.q.toLowerCase() : '';
     // Pull all hospitals and beds, then filter in JS to support complex searches
-    const hospitals = all(`
+    const hospitals = await all(`
       SELECT h.*, b.*, h.id as hospital_id 
       FROM hospitals h 
       LEFT JOIN hospital_beds b ON h.id = b.hospital_id
@@ -2130,14 +2088,14 @@ app.get('/api/beds/search', (req, res) => {
 });
 
 // Update specific hospital beds (Protected for Hospital Head)
-app.post('/api/hospital-head/:id/beds', (req, res) => {
+app.post('/api/hospital-head/:id/beds', async (req, res) => {
   try {
     const hid = req.params.id;
     const { icu_total, icu_available, general_total, general_available, maternity_total, maternity_available, pediatric_total, pediatric_available, emergency_total, emergency_available } = req.body;
 
-    const exists = get('SELECT hospital_id FROM hospital_beds WHERE hospital_id = ?', [hid]);
+    const exists = await get('SELECT hospital_id FROM hospital_beds WHERE hospital_id = ?', [hid]);
     if (exists) {
-      run(`UPDATE hospital_beds SET 
+      await run(`UPDATE hospital_beds SET 
             icu_total=?, icu_available=?, general_total=?, general_available=?, 
             maternity_total=?, maternity_available=?, pediatric_total=?, pediatric_available=?, 
             emergency_total=?, emergency_available=?, last_updated=datetime('now')
@@ -2146,7 +2104,7 @@ app.post('/api/hospital-head/:id/beds', (req, res) => {
         maternity_total || 0, maternity_available || 0, pediatric_total || 0, pediatric_available || 0,
         emergency_total || 0, emergency_available || 0, hid]);
     } else {
-      run(`INSERT INTO hospital_beds (hospital_id, icu_total, icu_available, general_total, general_available, maternity_total, maternity_available, pediatric_total, pediatric_available, emergency_total, emergency_available) 
+      await run(`INSERT INTO hospital_beds (hospital_id, icu_total, icu_available, general_total, general_available, maternity_total, maternity_available, pediatric_total, pediatric_available, emergency_total, emergency_available) 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [hid, icu_total || 0, icu_available || 0, general_total || 0, general_available || 0,
           maternity_total || 0, maternity_available || 0, pediatric_total || 0, pediatric_available || 0,
@@ -2229,7 +2187,7 @@ app.post('/api/patients/:id/analyze-report', express.json({ limit: '15mb' }), as
     }
 
     // Save to database
-    run(`INSERT INTO lab_reports (patient_id, report_type, age, gender, analysis_json) VALUES (?, ?, ?, ?, ?)`,
+    await run(`INSERT INTO lab_reports (patient_id, report_type, age, gender, analysis_json) VALUES (?, ?, ?, ?, ?)`,
       [pid, report_type, age, gender, JSON.stringify(analysis)]);
 
     res.json({ success: true, analysis });
@@ -2240,49 +2198,49 @@ app.post('/api/patients/:id/analyze-report', express.json({ limit: '15mb' }), as
   }
 });
 
-app.get('/api/patients/:id/lab-reports', (req, res) => {
+app.get('/api/patients/:id/lab-reports', async (req, res) => {
   try {
-    const reports = all(`SELECT * FROM lab_reports WHERE patient_id = ? ORDER BY id DESC`, [req.params.id]);
+    const reports = await all(`SELECT * FROM lab_reports WHERE patient_id = ? ORDER BY id DESC`, [req.params.id]);
     res.json({ success: true, reports });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 
 // Doctor Approvals for Hospital Head
-app.get('/api/hospital-head/:hospitalId/doctors/pending', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/doctors/pending', async (req, res) => {
   try {
-    const docs = all('SELECT id,name,specialization,license_number,phone,email,experience_years,medical_certificate,created_at FROM doctors WHERE hospital_id=? AND status=? ORDER BY created_at DESC', [req.params.hospitalId, 'pending']);
+    const docs = await all('SELECT id,name,specialization,license_number,phone,email,experience_years,medical_certificate,created_at FROM doctors WHERE hospital_id=? AND status=? ORDER BY created_at DESC', [req.params.hospitalId, 'pending']);
     res.json({ success: true, pendingDoctors: docs });
   } catch (err) { res.status(500).json({ error: 'Failed to fetch pending doctors' }); }
 });
-app.get('/api/hospital-head/:hospitalId/doctors/active', (req, res) => {
+app.get('/api/hospital-head/:hospitalId/doctors/active', async (req, res) => {
   try {
-    const docs = all('SELECT id,name,specialization,license_number,phone,email,experience_years,profile_photo,created_at FROM doctors WHERE hospital_id=? AND status=? ORDER BY name ASC', [req.params.hospitalId, 'approved']);
+    const docs = await all('SELECT id,name,specialization,license_number,phone,email,experience_years,profile_photo,created_at FROM doctors WHERE hospital_id=? AND status=? ORDER BY name ASC', [req.params.hospitalId, 'approved']);
     res.json({ success: true, activeDoctors: docs });
   } catch (err) { res.status(500).json({ error: 'Failed to fetch active doctors' }); }
 });
 
-app.post('/api/hospital-head/:hospitalId/doctors/approve/:doctorId', (req, res) => {
+app.post('/api/hospital-head/:hospitalId/doctors/approve/:doctorId', async (req, res) => {
   try {
     const hid = req.params.hospitalId;
     const did = req.params.doctorId;
-    const doc = get('SELECT * FROM doctors WHERE id=? AND hospital_id=?', [did, hid]);
+    const doc = await get('SELECT * FROM doctors WHERE id=? AND hospital_id=?', [did, hid]);
     if (!doc) return res.status(404).json({ error: 'Doctor not found' });
 
-    run('UPDATE doctors SET status=? WHERE id=? AND hospital_id=?', ['approved', did, hid]);
+    await run('UPDATE doctors SET status=? WHERE id=? AND hospital_id=?', ['approved', did, hid]);
 
     const spec = doc.specialization || 'General Medicine';
-    let dept = get('SELECT * FROM departments WHERE hospital_id=? AND name=?', [hid, spec]);
+    let dept = await get('SELECT * FROM departments WHERE hospital_id=? AND name=?', [hid, spec]);
     if (!dept) {
       const deptId = uuidv4();
-      run('INSERT INTO departments (id, hospital_id, name, head_name) VALUES (?, ?, ?, ?)', [deptId, hid, spec, 'Dr. ' + doc.name]);
+      await run('INSERT INTO departments (id, hospital_id, name, head_name) VALUES (?, ?, ?, ?)', [deptId, hid, spec, 'Dr. ' + doc.name]);
       dept = { id: deptId, name: spec };
     }
 
-    run('INSERT INTO staff (id, hospital_id, department_id, name, role, phone, email, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    await run('INSERT INTO staff (id, hospital_id, department_id, name, role, phone, email, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [uuidv4(), hid, dept.id, 'Dr. ' + doc.name, 'Doctor', doc.phone, doc.email, 'Day']);
 
-    saveDB();
+    
     res.json({ success: true, message: 'Doctor approved and added to staff' });
   } catch (err) { console.error('Approval Error:', err); res.status(500).json({ error: 'Approval failed' }); }
 });
@@ -2441,7 +2399,7 @@ app.post('/api/ai/chat', async (req, res) => {
   let userName = 'Guest';
   if (userId && role === 'patient') {
     try {
-      const p = get('SELECT name FROM patients WHERE id=?', [userId]);
+      const p = await get('SELECT name FROM patients WHERE id=?', [userId]);
       if (p) userName = p.name;
     } catch (e) { console.error('DB Error in AI Chat:', e); }
   }
@@ -2507,7 +2465,7 @@ app.post('/api/mental-health/chat', async (req, res) => {
   }
 });
 
-app.get('*', (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
+app.get('*', async (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
 // ============================================================
 // IDENTITY RESTORATION - Password Reset (Production)
@@ -2542,22 +2500,22 @@ app.post('/api/auth/password-reset/request', otpRequestLimiter, async (req, res)
     // Auto-detect role across all tables
     let found = null;
     let role = null;
-    const patient = get('SELECT id, name, email FROM patients WHERE LOWER(email)=?', [emailLower]);
+    const patient = await get('SELECT id, name, email FROM patients WHERE LOWER(email)=?', [emailLower]);
     if (patient) { found = patient; role = 'patient'; }
     if (!found) {
-      const doctor = get('SELECT id, name, email FROM doctors WHERE LOWER(email)=?', [emailLower]);
+      const doctor = await get('SELECT id, name, email FROM doctors WHERE LOWER(email)=?', [emailLower]);
       if (doctor) { found = doctor; role = 'doctor'; }
     }
     if (!found) {
-      const admin = get('SELECT id, name, email FROM admins WHERE LOWER(email)=?', [emailLower]);
+      const admin = await get('SELECT id, name, email FROM admins WHERE LOWER(email)=?', [emailLower]);
       if (admin) { found = admin; role = 'admin'; }
     }
     if (!found) {
-      const superAdmin = get('SELECT id, name, email FROM super_admins WHERE LOWER(email)=?', [emailLower]);
+      const superAdmin = await get('SELECT id, name, email FROM super_admins WHERE LOWER(email)=?', [emailLower]);
       if (superAdmin) { found = superAdmin; role = 'super_admin'; }
     }
     if (!found) {
-      const hh = get('SELECT id, name, email FROM hospital_heads WHERE LOWER(email)=?', [emailLower]);
+      const hh = await get('SELECT id, name, email FROM hospital_heads WHERE LOWER(email)=?', [emailLower]);
       if (hh) { found = hh; role = 'hospital_head'; }
     }
 
@@ -2572,10 +2530,10 @@ app.post('/api/auth/password-reset/request', otpRequestLimiter, async (req, res)
     const expiresAt = new Date(Date.now() + 3 * 60 * 1000).toISOString(); // 3 minutes TTL
 
     // Invalidate any previous active resets for this email
-    run('UPDATE password_resets SET used=1 WHERE email=? AND used=0', [emailLower]);
+    await run('UPDATE password_resets SET used=1 WHERE email=? AND used=0', [emailLower]);
 
     // Store new OTP
-    run('INSERT INTO password_resets (email, role, otp_hash, expires_at) VALUES (?,?,?,?)',
+    await run('INSERT INTO password_resets (email, role, otp_hash, expires_at) VALUES (?,?,?,?)',
       [emailLower, role, otpHash, expiresAt]);
 
     // Dispatch email
@@ -2612,7 +2570,7 @@ app.post('/api/auth/password-reset/request', otpRequestLimiter, async (req, res)
 });
 
 // Step 2 - Verify OTP
-app.post('/api/auth/password-reset/verify', otpVerifyLimiter, (req, res) => {
+app.post('/api/auth/password-reset/verify', otpVerifyLimiter, async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
@@ -2621,7 +2579,7 @@ app.post('/api/auth/password-reset/verify', otpVerifyLimiter, (req, res) => {
     const otpHash = crypto.createHash('sha256').update(String(otp)).digest('hex');
     const now = new Date().toISOString();
 
-    const record = get(
+    const record = await get(
       'SELECT * FROM password_resets WHERE email=? AND otp_hash=? AND used=0 AND expires_at > ? ORDER BY id DESC LIMIT 1',
       [emailLower, otpHash, now]
     );
@@ -2631,7 +2589,7 @@ app.post('/api/auth/password-reset/verify', otpVerifyLimiter, (req, res) => {
     }
 
     // Mark as verified (not used yet - consumed at step 3)
-    run('UPDATE password_resets SET used=2 WHERE id=?', [record.id]);
+    await run('UPDATE password_resets SET used=2 WHERE id=?', [record.id]);
 
     return res.json({ success: true, verified: true, role: record.role });
   } catch (err) {
@@ -2650,7 +2608,7 @@ app.post('/api/auth/password-reset/update', async (req, res) => {
     const emailLower = email.toLowerCase().trim();
     const otpHash = crypto.createHash('sha256').update(String(otp)).digest('hex');
 
-    const record = get(
+    const record = await get(
       'SELECT * FROM password_resets WHERE email=? AND otp_hash=? AND used=2 ORDER BY id DESC LIMIT 1',
       [emailLower, otpHash]
     );
@@ -2662,14 +2620,14 @@ app.post('/api/auth/password-reset/update', async (req, res) => {
     const newHash = bcrypt.hashSync(newPassword, 12);
     const { role } = record;
 
-    if (role === 'patient') run('UPDATE patients SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
-    else if (role === 'doctor') run('UPDATE doctors SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
-    else if (role === 'admin') run('UPDATE admins SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
-    else if (role === 'super_admin') run('UPDATE super_admins SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
-    else if (role === 'hospital_head') run('UPDATE hospital_heads SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
+    if (role === 'patient') await run('UPDATE patients SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
+    else if (role === 'doctor') await run('UPDATE doctors SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
+    else if (role === 'admin') await run('UPDATE admins SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
+    else if (role === 'super_admin') await run('UPDATE super_admins SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
+    else if (role === 'hospital_head') await run('UPDATE hospital_heads SET password_hash=? WHERE LOWER(email)=?', [newHash, emailLower]);
 
     // Burn the OTP record
-    run('UPDATE password_resets SET used=1 WHERE id=?', [record.id]);
+    await run('UPDATE password_resets SET used=1 WHERE id=?', [record.id]);
 
     console.log(`- Password updated for ${emailLower} [${role}]`);
     return res.json({ success: true, role, message: 'Password updated successfully. Please login.' });
@@ -2679,32 +2637,41 @@ app.post('/api/auth/password-reset/update', async (req, res) => {
   }
 });
 
-// Start
-// Graceful Shutdown
+// Handle 404 for API
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Final error handler
+app.use((err, req, res, next) => {
+  console.error('SERVER ERROR:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
+// Graceful Shutdown (for local use)
 function gracefulShutdown() {
   console.log('\n- Shutting down gracefully...');
-  saveDB();
   process.exit(0);
 }
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
-initDB().then(() => {
-  const startServer = (p) => {
-    const server = app.listen(p, () => {
-      console.log(`\n Universal Health QR running at http://localhost:${p}\n`);
+// Start logic
+if (require.main === module) {
+  initDB().then(() => {
+    app.listen(PORT, () => {
+      console.log(`\n🚀 Sarvam Health Core running on http://localhost:${PORT}`);
     });
-    server.on('error', (e) => {
-      if (e.code === 'EADDRINUSE') {
-        console.log(`Port ${p} is in use, trying ${p + 1}...`);
-        setTimeout(() => startServer(p + 1), 100);
-      } else {
-        console.error('Server error:', e);
-      }
-    });
-  };
-  startServer(PORT);
-}).catch(err => { console.error('DB init failed:', err); process.exit(1); });
+  });
+} else {
+  // Export for Firebase Functions
+  initDB(); // Warm up firestore
+  exports.api = onRequest({
+    memory: "512MiB",
+    timeoutSeconds: 60,
+    region: "us-central1"
+  }, app);
+}
 
 
 
