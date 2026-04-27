@@ -452,24 +452,41 @@ function renderLanding(app) {
     const assets = document.querySelectorAll('.floating-3d-asset');
 
     if (b1 && b2) {
-      window.addEventListener('mousemove', (e) => {
-        const x = e.clientX;
-        const y = e.clientY;
-        const centerX = window.innerWidth / 2;
-        const centerY = window.innerHeight / 2;
+      if (window._parallaxHandler) {
+        window.removeEventListener('mousemove', window._parallaxHandler);
+      }
 
-        b1.style.transform = `translate(${x / 15}px, ${y / 15}px)`;
-        b2.style.transform = `translate(${-x / 20}px, ${-y / 20}px)`;
-        if (grid) grid.style.transform = `translate(${x / 60}px, ${y / 60}px)`;
+      let ticking = false;
+      let mouseX = 0;
+      let mouseY = 0;
 
-        // Asset Parallax
-        assets.forEach((asset, i) => {
-          const depth = (i + 1) * 30;
-          const moveX = (x - centerX) / depth;
-          const moveY = (y - centerY) / depth;
-          asset.style.transform = `translate(${moveX}px, ${moveY}px)`;
-        });
-      });
+      window._parallaxHandler = (e) => {
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+
+        if (!ticking) {
+          window.requestAnimationFrame(() => {
+            const centerX = window.innerWidth / 2;
+            const centerY = window.innerHeight / 2;
+
+            b1.style.transform = `translate(${mouseX / 15}px, ${mouseY / 15}px)`;
+            b2.style.transform = `translate(${-mouseX / 20}px, ${-mouseY / 20}px)`;
+            if (grid) grid.style.transform = `translate(${mouseX / 60}px, ${mouseY / 60}px)`;
+
+            // Asset Parallax
+            assets.forEach((asset, i) => {
+              const depth = (i + 1) * 30;
+              const moveX = (mouseX - centerX) / depth;
+              const moveY = (mouseY - centerY) / depth;
+              asset.style.transform = `translate(${moveX}px, ${moveY}px)`;
+            });
+            ticking = false;
+          });
+          ticking = true;
+        }
+      };
+
+      window.addEventListener('mousemove', window._parallaxHandler);
     }
 
     // Modern Sidebar Index & Section Reveal Observer
@@ -564,7 +581,7 @@ function renderRegistrationEmailVerification(app, role) {
       <div class="login-card">
         <div style="text-align:center;margin-bottom:1.5rem">
           <div style="width:3.5rem;height:3.5rem;border-radius:50%;background:var(--primary-light);color:var(--primary);display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.75rem">${icon('mark_email_read')}</div>
-          <h2>Verify Your Email</h2><p>Please confirm your email before registering as a ${role}</p>
+          <h2>Verify Your Email</h2><p>Please confirm your email before registering your ${role || 'new'} account</p>
         </div>
         <div class="form-group"><label class="form-label">Email Address</label><input class="form-input" id="reg-verify-email" type="email" placeholder="you@example.com"></div>
         <button class="btn btn-primary btn-block mb-2" id="reg-verify-send-btn">${icon('send')} Send Verification Code</button>
@@ -2696,26 +2713,47 @@ async function sendAIMessage(message, patientId) {
   scrollToChatBottom();
 
   try {
-    const data = await api('/api/ai/chat', {
+    const response = await fetch('/api/ai/chat', {
       method: 'POST',
-      body: { message, patient_id: patientId }
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        messages: [{ role: 'user', content: message }], 
+        userId: patientId, 
+        role: 'patient',
+        stream: true 
+      })
     });
+
+    if (!response.ok) throw new Error('API connection failed');
 
     // Hide typing
     if (typingEl) typingEl.classList.add('hidden');
 
-    // Format the reply with markdown-like rendering
-    const formattedReply = formatAIReply(data.reply);
-
-    const botHtml = `<div class="ai-message bot">
+    const botMsgId = 'bot-' + Date.now();
+    const botHtml = `<div class="ai-message bot" id="${botMsgId}">
       <div class="ai-message-avatar">${icon('smart_toy')}</div>
-      <div class="ai-message-content">
-        ${formattedReply}
-        ${data.category === 'emergency' ? '<div class="ai-emergency-alert">' + icon('emergency') + ' This may be a medical emergency. Please seek immediate help.</div>' : ''}
-      </div>
+      <div class="ai-message-content"></div>
     </div>`;
     messagesEl.insertAdjacentHTML('beforeend', botHtml);
+    const contentEl = document.getElementById(botMsgId).querySelector('.ai-message-content');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullReply = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      fullReply += chunk;
+      
+      // Update UI with formatted reply
+      contentEl.innerHTML = formatAIReply(fullReply);
+      scrollToChatBottom();
+    }
   } catch (e) {
+    console.error('AI Error:', e);
+    if (typingEl) typingEl.classList.add('hidden');
     const errorHtml = `<div class="ai-message bot">
       <div class="ai-message-avatar">${icon('smart_toy')}</div>
       <div class="ai-message-content"><p>I'm sorry, I couldn't process your request. Please try again.</p></div>
@@ -2739,10 +2777,36 @@ function escapeHtml(text) {
 }
 
 function formatAIReply(text) {
-  let html = escapeHtml(text);
+  // Step 1: Decode HTML entities that the model may have output literally
+  // (e.g. &lt;strong&gt; → <strong>)
+  let cleanText = text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  // Step 2: Convert HTML tags to Markdown equivalents before escaping
+  cleanText = cleanText
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<p[^>]*>/gi, '')
+    .replace(/<\/?strong>|<\/?b>/gi, '**')
+    .replace(/<\/?em>|<\/?i>/gi, '*')
+    .replace(/<li>/gi, '\n- ')
+    .replace(/<\/li>/gi, '')
+    .replace(/<\/?ul>|<\/?ol>/gi, '\n')
+    .replace(/<h[1-6][^>]*>/gi, '\n**')
+    .replace(/<\/h[1-6]>/gi, '**\n')
+    .replace(/<[^>]*>/g, '');
+  
+  let html = escapeHtml(cleanText);
 
   // Bold
   html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+
+  // Italic
+  html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
 
   // Tables
   html = html.replace(/\|(.+)\|\n\|[-| ]+\|\n((?:\|.+\|\n?)+)/g, (match, headerRow, bodyRows) => {
@@ -2755,11 +2819,12 @@ function formatAIReply(text) {
   });
 
   // Lists
-  html = html.replace(/^(\*|-)\s+(.+)$/gm, '<li>$2</li>');
-  html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+  html = html.replace(/^\s*(\*|-)\s+(.+)$/gm, '<li>$2</li>');
+  html = html.replace(/(?:<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
 
   // Numbered lists
-  html = html.replace(/^(\d+)\.\s+(.+)$/gm, '<li>$2</li>');
+  html = html.replace(/^\s*(\d+)\.\s+(.+)$/gm, '<li>$2</li>');
+  html = html.replace(/(?:<li>.*<\/li>\n?)+/g, (m) => m.includes('<ul>') ? m : `<ol>${m}</ol>`);
 
   // Paragraphs (double newlines)
   html = html.replace(/\n\n/g, '</p><p>');
@@ -2769,7 +2834,7 @@ function formatAIReply(text) {
   if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 
   // Emoji markers for sections
-  html = html.replace(/(|---|||||)/g, '<span class="ai-emoji">$1</span>');
+  html = html.replace(/(⚠|---|🏥|💊|🩺|📋|❗)/g, '<span class="ai-emoji">$1</span>');
 
   return html;
 }
@@ -3051,7 +3116,7 @@ function renderMHLanding(app) {
   app.innerHTML = `
     <div class="theme-mental-health" style="min-height:100vh;padding-bottom:4rem">
       ${renderMHNav()}
-      <div class="container" style="padding-top:4rem">
+      <div class="container" style="padding-top:2rem">
         <div class="text-center" style="margin-bottom:4rem">
           <h1 style="color:var(--primary);font-size:3rem;margin-bottom:1rem;font-weight:800">You are not alone.</h1>
           <p style="font-size:1.25rem;color:var(--on-surface-variant);max-width:600px;margin:0 auto">A safe, anonymous space to check in with yourself, find peace, and talk without judgment. No names required.</p>
@@ -3097,7 +3162,7 @@ function renderMHLanding(app) {
         </div>
         
         <div class="text-center" style="margin-top:4rem">
-          <button class="btn btn-outline" onclick="navigate('/mental-health/therapists')" style="background:transparent;border:2px solid var(--primary);color:var(--primary)">${icon('search')} Find a Human Therapist</button>
+          <button class="btn btn-outline" onclick="navigate('/mental-health/therapists')">${icon('search')} Find a Human Therapist</button>
         </div>
       </div>
     </div>
@@ -3266,20 +3331,47 @@ function renderMHChat(app) {
     win.scrollTop = win.scrollHeight;
 
     try {
-      const res = await api('/api/mental-health/chat', { method: 'POST', body: { messages } });
-      document.getElementById(loadingId).remove();
-      const reply = res.reply.content;
+      const response = await fetch('/api/mental-health/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, stream: true })
+      });
+
+      if (!response.ok) throw new Error('API connection failed');
+
+      // Remove loading indicator
+      const loader = document.getElementById(loadingId);
+      if (loader) loader.remove();
+
+      const botMsgId = 'bot-' + Date.now();
       win.innerHTML += `
-        <div class="ai-message bot">
+        <div class="ai-message bot" id="${botMsgId}">
           <div class="ai-avatar">${icon('spa', 'text-white')}</div>
-          <div class="ai-message-content">${reply.replace(/\\n/g, "<br>")}</div>
+          <div class="ai-message-content"></div>
         </div>
       `;
-      messages.push({ role: 'assistant', content: reply });
-      win.scrollTop = win.scrollHeight;
+      const contentEl = document.getElementById(botMsgId).querySelector('.ai-message-content');
+      
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullReply = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        fullReply += chunk;
+        // Use the same formatter as the health chat to strip HTML and render Markdown
+        contentEl.innerHTML = formatAIReply(fullReply);
+        win.scrollTop = win.scrollHeight;
+      }
+
+      messages.push({ role: 'assistant', content: fullReply });
     } catch (e) {
-      document.getElementById(loadingId).remove();
-      showToast('Disconnected from chat.', 'error');
+      console.error('Chat Error:', e);
+      const loader = document.getElementById(loadingId);
+      if (loader) loader.remove();
+      showToast('Neural link interrupted. Please try again.', 'error');
     }
   };
 }

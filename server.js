@@ -233,13 +233,17 @@ function buildContactEmailHtml(data) {
 const OpenAI = require('openai');
 
 // Initialize OpenAI client
+console.log('- Initializing AI Neural Link...');
+console.log(`  - Base URL: ${process.env.OPENAI_API_BASE_URL || 'https://integrate.api.nvidia.com/v1'}`);
+console.log(`  - Model: ${process.env.OPENAI_MODEL || 'meta/llama-3.1-70b-instruct'}`);
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || 'MISSING_API_KEY',
   baseURL: process.env.OPENAI_API_BASE_URL || 'https://integrate.api.nvidia.com/v1'
 });
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || 3000);
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -298,6 +302,15 @@ function sseSend(map, id, event, data) {
   });
 }
 
+// Force browsers to always fetch fresh JS/HTML files (prevent caching of stale code)
+app.use((req, res, next) => {
+  if (req.path.endsWith('.js') || req.path.endsWith('.html') || req.path === '/') {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 const storage = multer.memoryStorage();
@@ -307,10 +320,23 @@ let db;
 const DB_PATH = path.join(__dirname, 'healthqr.db');
 
 // DB helpers for sql.js
-function run(sql, params = []) { db.run(sql, params); saveDB(); }
+// DB helpers for sql.js - Debounced to prevent event loop blocking on high-frequency writes
+let saveTimeout = null;
+function run(sql, params = []) {
+  db.run(sql, params);
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(saveDB, 500);
+}
 function get(sql, params = []) { const stmt = db.prepare(sql); stmt.bind(params); if (stmt.step()) { const r = stmt.getAsObject(); stmt.free(); return r; } stmt.free(); return null; }
 function all(sql, params = []) { const results = []; const stmt = db.prepare(sql); stmt.bind(params); while (stmt.step()) results.push(stmt.getAsObject()); stmt.free(); return results; }
-function saveDB() { const data = db.export(); fs.writeFileSync(DB_PATH, Buffer.from(data)); }
+function saveDB() {
+  try {
+    const data = db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (err) {
+    console.error('CRITICAL: Database Save Failed:', err);
+  }
+}
 
 function generatePatientId(name, phone) {
   return crypto.createHash('sha256').update(`${name}-${phone}-${Date.now()}-${uuidv4()}`).digest('hex').substring(0, 16);
@@ -2038,94 +2064,7 @@ function buildPatientContext(patientContext) {
 }
 
 // OpenAI-powered chat endpoint with rule-based fallback
-app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const { message, patient_id } = req.body;
-    if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
-    let patientContext = null;
-    if (patient_id) {
-      const p = get('SELECT p.name, p.blood_group, p.dob, mh.allergies, mh.chronic_conditions FROM patients p LEFT JOIN medical_history mh ON p.id = mh.patient_id WHERE p.id = ?', [patient_id]);
-      if (p) {
-        patientContext = {
-          name: p.name,
-          blood_group: p.blood_group,
-          allergies: JSON.parse(p.allergies || '[]'),
-          chronic_conditions: JSON.parse(p.chronic_conditions || '[]'),
-          age: p.dob ? Math.floor((Date.now() - new Date(p.dob)) / 31557600000) : null
-        };
-      }
-    }
-
-    // Fallback to rule-based if no API key
-    if (!process.env.OPENAI_API_KEY) {
-      const response = generateHealthResponse(message, patientContext);
-      return res.json({ success: true, ...response, timestamp: new Date().toISOString(), ai_provider: 'rule-based' });
-    }
-
-    // Use OpenAI
-    const sessionId = patient_id || req.ip || 'anonymous';
-    if (!chatHistories[sessionId]) chatHistories[sessionId] = [];
-
-    chatHistories[sessionId].push({ role: 'user', content: message.trim() });
-    if (chatHistories[sessionId].length > MAX_HISTORY) {
-      chatHistories[sessionId] = chatHistories[sessionId].slice(-MAX_HISTORY);
-    }
-
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPT + buildPatientContext(patientContext) },
-      ...chatHistories[sessionId]
-    ];
-
-    const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      messages,
-      max_tokens: 1024,
-      temperature: 0.7,
-    });
-
-    const reply = completion.choices[0]?.message?.content || 'I apologize, I could not generate a response. Please try again.';
-    chatHistories[sessionId].push({ role: 'assistant', content: reply });
-
-    // Detect category from message content
-    let category = 'general';
-    const msgLower = message.toLowerCase();
-    if (/emergency|chest\s*pain|heart\s*attack|stroke|can't\s*breathe|suicide/i.test(msgLower)) category = 'emergency';
-    else if (/fever|headache|cold|cough|stomach|pain|skin|rash/i.test(msgLower)) category = 'symptom';
-    else if (/medication|medicine|drug|tablet|paracetamol/i.test(msgLower)) category = 'medication';
-    else if (/nutrition|diet|food|eat|meal/i.test(msgLower)) category = 'nutrition';
-    else if (/exercise|workout|fitness|gym|yoga/i.test(msgLower)) category = 'fitness';
-    else if (/stress|anxiety|depression|mental|sleep|insomnia/i.test(msgLower)) category = 'wellness';
-    else if (/bmi|body\s*mass/i.test(msgLower)) category = 'bmi';
-    else if (/diabetes|blood\s*sugar/i.test(msgLower)) category = 'condition';
-    else if (/blood\s*pressure|hypertension/i.test(msgLower)) category = 'condition';
-    else if (/vaccin|immuniz/i.test(msgLower)) category = 'preventive';
-
-    res.json({ success: true, reply, category, timestamp: new Date().toISOString(), ai_provider: 'openai' });
-  } catch (err) {
-    console.error('OpenAI API error:', err.message);
-    // Fallback to rule-based on API failure
-    try {
-      const { message, patient_id } = req.body;
-      let patientContext = null;
-      if (patient_id) {
-        const p = get('SELECT p.name, p.blood_group, p.dob, mh.allergies, mh.chronic_conditions FROM patients p LEFT JOIN medical_history mh ON p.id = mh.patient_id WHERE p.id = ?', [patient_id]);
-        if (p) {
-          patientContext = {
-            name: p.name, blood_group: p.blood_group,
-            allergies: JSON.parse(p.allergies || '[]'),
-            chronic_conditions: JSON.parse(p.chronic_conditions || '[]'),
-            age: p.dob ? Math.floor((Date.now() - new Date(p.dob)) / 31557600000) : null
-          };
-        }
-      }
-      const response = generateHealthResponse(message, patientContext);
-      res.json({ success: true, ...response, timestamp: new Date().toISOString(), ai_provider: 'rule-based-fallback' });
-    } catch (fallbackErr) {
-      res.status(500).json({ error: 'Failed to process message' });
-    }
-  }
-});
 
 // Health tips endpoint
 app.get('/api/ai/tips', (req, res) => {
@@ -2217,35 +2156,6 @@ app.post('/api/hospital-head/:id/beds', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==========================================
-// AI HEALTH ASSISTANT ENDPOINT (NVIDIA NIM)
-// ==========================================
-app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const { messages, userId, role } = req.body;
-    if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Invalid messages array' });
-
-    // System prompt tailored to Universal Health QR
-    const systemPrompt = {
-      role: 'system',
-      content: `You are the Universal Health QR AI Assistant. Be concise, empathetic, and professional. You provide general health guidance, explain medical terms, and help users navigate the Universal Health QR system. IMPORTANT: Emphasize that you are an AI, not a doctor, and users should consult a real physician for medical advice.`
-    };
-
-    const apiMessages = [systemPrompt, ...messages];
-
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "meta/llama-3.1-70b-instruct",
-      messages: apiMessages,
-      temperature: 0.5,
-      max_tokens: 500
-    });
-
-    res.json({ success: true, message: response.choices[0].message });
-  } catch (err) {
-    console.error('AI Chat Error:', err);
-    res.status(500).json({ error: 'AI Assistant is currently unavailable.' });
-  }
-});
 
 // ==========================================
 // HEALTH REPORT ANALYZER (VISION API)
@@ -2337,51 +2247,6 @@ app.get('/api/patients/:id/lab-reports', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==========================================
-// MENTAL HEALTH SUPPORT ENDPOINT
-// ==========================================
-app.post('/api/mental-health/chat', async (req, res) => {
-  try {
-    const { messages } = req.body;
-    if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Invalid messages array' });
-
-    // Enforce prompt injection for mental health persona
-    const systemPrompt = {
-      role: 'system',
-      content: `You are an empathetic, compassionate, and non-judgmental anonymous mental health companion.
-      
-      CORE DIRECTIVES:
-      1. Provide a safe, anonymous space. Validate the user's feelings.
-      2. You are NOT a licensed psychiatrist or crisis counselor.
-      3. If a user exhibits signs of severe crisis, self-harm, or suicide, you MUST gently but firmly provide these Indian helplines:
-         - iCall: 9152987821
-         - Vandrevala Foundation: 1860-2662-345 (24/7)
-         - Aasra: 9820466726
-      4. Keep responses conversational, concise (under 150 words usually), and emotionally warm.
-      5. Never ask for their real name or personal identifying info.`
-    };
-
-    // Inject system prompt to the beginning
-    const payloadMessages = [systemPrompt, ...messages];
-
-    // Call OpenAI
-    const completion = await openai.chat.completions.create({
-      model: "meta/llama-3.1-70b-instruct",
-      messages: payloadMessages,
-      temperature: 0.6,
-      max_tokens: 500,
-    });
-
-    res.json({ success: true, reply: completion.choices[0].message });
-  } catch (e) {
-    console.error('Mental Health Chat error:', e);
-    // Fallback response if AI fails
-    res.json({
-      success: true,
-      reply: { role: 'assistant', content: 'I am so sorry, I am having trouble connecting right now. Please know that you are not alone. If you are in crisis, please call Vandrevala Foundation at 1860-2662-345 immediately.' }
-    });
-  }
-});
 
 // Doctor Approvals for Hospital Head
 app.get('/api/hospital-head/:hospitalId/doctors/pending', (req, res) => {
@@ -2428,46 +2293,178 @@ app.post('/api/hospital-head/:hospitalId/doctors/approve/:doctorId', (req, res) 
 // ============================================================
 
 /**
+ * Strip HTML tags from AI output, converting common ones to Markdown equivalents.
+ * Ensures the frontend never receives raw HTML from the model.
+ */
+function stripHtmlToMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<p>/gi, '')
+    .replace(/<\/?strong>|<\/?b>/gi, '**')
+    .replace(/<\/?em>|<\/?i>/gi, '*')
+    .replace(/<li>/gi, '\n- ')
+    .replace(/<\/li>/gi, '')
+    .replace(/<\/?ul>|<\/?ol>/gi, '\n')
+    .replace(/<h[1-6][^>]*>/gi, '\n**')
+    .replace(/<\/h[1-6]>/gi, '**\n')
+    .replace(/<[^>]*>/g, '');
+}
+
+/**
  * Shared AI Completion Helper
  * Interfaces with NVIDIA/OpenAI compatible models
  */
 async function getAICompletion(messages, systemPrompt) {
   try {
-    const completion = await openai.chat.completions.create({
+    const completionOptions = {
       model: process.env.OPENAI_MODEL || 'meta/llama-3.1-70b-instruct',
       messages: [
         { role: 'system', content: systemPrompt },
         ...messages
       ],
-      temperature: 0.7,
-      max_tokens: 1000
-    });
-    return completion.choices[0].message;
+      temperature: 1.0,
+      top_p: 0.95,
+      max_tokens: 4096
+    };
+
+    // Only add reasoning parameters if it's the DeepSeek reasoning model
+    if (completionOptions.model.includes('deepseek-v4')) {
+      completionOptions.chat_template_kwargs = { "thinking": true, "reasoning_effort": "low" };
+    }
+
+    console.log(`- Requesting AI completion from model: ${completionOptions.model}`);
+    const completion = await openai.chat.completions.create(completionOptions);
+    console.log('- AI Response received successfully.');
+
+    // Strip any HTML tags the model may have generated, convert to Markdown
+    const msg = completion.choices[0].message;
+    const cleanContent = stripHtmlToMarkdown(msg.content || '');
+    return { role: 'assistant', content: cleanContent };
   } catch (err) {
     console.error('AI Neural Link Failure:', err.message);
     throw err;
   }
 }
 
+/**
+ * Streaming version of AI completion
+ */
+async function streamAICompletion(messages, systemPrompt, res) {
+  try {
+    const completionOptions = {
+      model: process.env.OPENAI_MODEL || 'meta/llama-3.1-70b-instruct',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ],
+      temperature: 0.7,
+      top_p: 0.95,
+      max_tokens: 2048,
+      stream: true
+    };
+
+    if (completionOptions.model.includes('deepseek-v4')) {
+      completionOptions.chat_template_kwargs = { "thinking": true, "reasoning_effort": "low" };
+    }
+
+    console.log(`- Initiating AI Stream from model: ${completionOptions.model}`);
+    const stream = await openai.chat.completions.create(completionOptions);
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    let chunkCount = 0;
+    let inTag = false;
+    let currentTag = '';
+
+    for await (const chunk of stream) {
+      // Explicitly skip reasoning_content deltas to avoid visual clutter
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) {
+        chunkCount++;
+        let outputText = '';
+        for (let char of content) {
+          if (char === '<') {
+            inTag = true;
+            currentTag = '<';
+          } else if (char === '>') {
+            inTag = false;
+            currentTag += '>';
+            let tagLower = currentTag.toLowerCase().trim();
+            let tagName = tagLower.replace(/[^a-z\/]/g, ''); // extract just the tag name like "p", "/p", "strong", "br", etc.
+            // Handle common tags and convert them to Markdown
+            if (tagName === 'br' || tagName === 'li' || tagName === 'ul' || tagName === 'ol') {
+              outputText += '\n';
+            } else if (tagName === 'p' || tagName === '/p') {
+              outputText += '\n\n';
+            } else if (tagName === 'strong' || tagName === '/strong' || tagName === 'b' || tagName === '/b') {
+              outputText += '**';
+            } else if (tagName === 'em' || tagName === '/em' || tagName === 'i' || tagName === '/i') {
+              outputText += '*';
+            }
+            // All other tags are effectively stripped by not adding them to outputText
+            currentTag = '';
+          } else if (inTag) {
+            currentTag += char;
+          } else {
+            outputText += char;
+          }
+        }
+        if (outputText) {
+          res.write(outputText);
+        }
+      }
+    }
+    console.log(`- AI Stream completed successfully (${chunkCount} chunks).`);
+    res.end();
+  } catch (err) {
+    console.error('AI Stream Failure:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Streaming failed', details: err.message });
+    } else {
+      res.end();
+    }
+  }
+}
+
 // 1. General AI Health Assistant
 app.post('/api/ai/chat', async (req, res) => {
   const { messages, userId, role } = req.body;
+  console.log(`[AI] Processing health chat request for user: ${userId || 'anonymous'} (${role || 'guest'})`);
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'Conversation history required (messages array)' });
   }
 
-  const systemPrompt = `You are the Sarvam Health AI, a high-intelligence medical assistant for the Universal Health QR ecosystem. 
-  Your goal is to help users understand their medical records, provide wellness advice, and explain clinical terms.
+  let userName = 'Guest';
+  if (userId && role === 'patient') {
+    try {
+      const p = get('SELECT name FROM patients WHERE id=?', [userId]);
+      if (p) userName = p.name;
+    } catch (e) { console.error('DB Error in AI Chat:', e); }
+  }
+
+  const systemPrompt = `You are the Sarvam Health AI.
+  
+  MANDATORY FORMATTING RULES:
+  - NEVER use HTML tags (no <p>, <br>, <li>, etc.)
+  - ONLY use Markdown for formatting (**bold**, - lists)
+  - Address the user as "${userName}" and NEVER use their ID (${userId})
+  
+  GOAL: Help users understand records, provide wellness advice, and explain clinical terms.
   
   GUIDELINES:
-  1. Maintain a professional, empathetic, and clinical tone.
-  2. For emergency symptoms (chest pain, stroke signs, etc.), prioritize advice to seek urgent care.
-  3. Use UHQR context (ABHA ID, Digital Health Lockers, PHI).
-  4. DO NOT provide definitive diagnoses. Use suggestive language: "Your symptoms might indicate..."
-  5. User is a ${role || 'user'}. ID: ${userId || 'anonymous'}.`;
+  1. Professional and empathetic tone.
+  2. Prioritize urgent care for emergency symptoms.
+  3. Use suggestive language for potential conditions (no definitive diagnosis).
+  4. Match the user's language exactly.`;
 
   try {
+    if (req.body.stream) {
+      return streamAICompletion(messages, systemPrompt, res);
+    }
     const response = await getAICompletion(messages, systemPrompt);
     res.json({ message: response });
   } catch (err) {
@@ -2495,9 +2492,14 @@ app.post('/api/mental-health/chat', async (req, res) => {
   2. DO NOT provide medical advice or psychiatric diagnosis.
   3. If a user mentions self-harm or deep crisis, provide international helpline info and encourage professional help.
   4. Focus on stress reduction, mindfulness, and coping strategies.
-  5. Maintain strict privacy—never ask for identifying information.`;
+  5. Maintain strict privacy—never ask for identifying information.
+  6. LANGUAGE: Always detect the language of the user's input and respond in that same language.
+  7. FORMATTING: Use Markdown only (e.g., **bold**, *italic*, lists). Do NOT use raw HTML tags.`;
 
   try {
+    if (req.body.stream) {
+      return streamAICompletion(messages, systemPrompt, res);
+    }
     const response = await getAICompletion(messages, systemPrompt);
     res.json({ message: response });
   } catch (err) {
@@ -2678,6 +2680,15 @@ app.post('/api/auth/password-reset/update', async (req, res) => {
 });
 
 // Start
+// Graceful Shutdown
+function gracefulShutdown() {
+  console.log('\n- Shutting down gracefully...');
+  saveDB();
+  process.exit(0);
+}
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+
 initDB().then(() => {
   const startServer = (p) => {
     const server = app.listen(p, () => {

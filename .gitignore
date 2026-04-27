@@ -3,11 +3,17 @@ node_modules/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 healthqr.db
 
-# Environment variables (if you ever add them)
+# Environment variables
 .env
 .env.local
+
+# Agent / Tooling
+.agent/
+scratch/
 
 # Windows reserved names
 nul
