@@ -241,11 +241,15 @@ if (admin.apps.length === 0) {
       });
       console.log('- Firebase Initialized via Service Account (Railway mode)');
     } catch (e) {
-      console.error('- Firebase Service Account Parse Error:', e);
-      admin.initializeApp();
+      console.error('CRITICAL: Firebase Service Account Parse Error:', e.message);
+      // Don't initialize without credentials as it will crash in non-Google environments
     }
   } else {
-    admin.initializeApp();
+    console.warn('WARNING: No SERVICE_ACCOUNT_KEY found. Firestore operations will fail.');
+    // Only attempt default if we are likely in a GCP environment
+    if (process.env.GOOGLE_CLOUD_PROJECT) {
+       admin.initializeApp();
+    }
   }
 }
 const firestore = admin.firestore();
