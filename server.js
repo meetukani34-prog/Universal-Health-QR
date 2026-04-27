@@ -13,6 +13,11 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
+
+// Initialize Resend if key exists
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+if (resend) console.log('- Resend Mailer Ready (API Key detected)');
 const rateLimit = require('express-rate-limit');
 
 // -- Nodemailer Transport --------------------------------------
@@ -185,30 +190,55 @@ function buildLoginOtpEmailHtml(otp, recipientName = 'User', purpose = 'login') 
 </body>
 </html>`;
 }
-async function sendOtpEmail(toEmail, otp, recipientName) {
-  // Gmail often requires name to be quoted if containing spaces
-  const fromName = process.env.APP_NAME || 'Sarvam Health';
-  const fromEmail = process.env.SMTP_USER;
-  const fromString = `"${fromName}" <${fromEmail}>`;
+/**
+ * Unified Email Sender
+ * Supports: Resend (API), Nodemailer (SMTP)
+ */
+async function sendUniversalEmail({ to, subject, html, text, replyTo }) {
+  const from = process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`;
 
-  const mailOptions = {
-    from: process.env.SMTP_FROM || fromString,
-    to: toEmail,
-    subject: `${otp} - Your Sarvam Identity Restoration Code`,
-    html: buildOtpEmailHtml(otp, recipientName),
-    text: `Your Sarvam password reset OTP is: ${otp}. It expires in 3 minutes. Do not share it with anyone.`
-  };
+  // Option 1: Resend (Recommended for Reliability)
+  if (resend) {
+    try {
+      // Resend requires verified domains or "onboarding@resend.dev"
+      const resendFrom = from.includes('resend.dev') || from.includes('sarvam') ? from : 'onboarding@resend.dev';
 
-  try {
-    const info = await Promise.race([
-      mailerTransport.sendMail(mailOptions),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
-    ]);
-    return info;
-  } catch (err) {
-    console.error(' - SMTP Dispatch Timeout/Failure:', err.message);
-    throw err;
+      const { data, error } = await resend.emails.send({
+        from: resendFrom.includes('<') ? resendFrom : `"Sarvam Health" <${resendFrom}>`,
+        to,
+        replyTo,
+        subject,
+        html,
+        text
+      });
+      if (error) throw error;
+      return { success: true, provider: 'resend', id: data.id };
+    } catch (err) {
+      console.warn('- Resend failed, falling back to SMTP:', err.message);
+    }
   }
+
+  // Option 2: Nodemailer (SMTP Fallback)
+  return new Promise((resolve, reject) => {
+    mailerTransport.sendMail({ from, to, subject, html, text, replyTo }, (err, info) => {
+      if (err) {
+        console.error('- SMTP Error:', err.message);
+        return reject(err);
+      }
+      resolve({ success: true, provider: 'smtp', id: info.messageId });
+    });
+  });
+}
+
+async function sendOtpEmail(toEmail, otp, recipientName) {
+  const html = buildOtpEmailHtml(otp, recipientName);
+  const text = `Your Sarvam identity restoration code is: ${otp}. Expires in 3 minutes.`;
+  return sendUniversalEmail({
+    to: toEmail,
+    subject: `${otp} - Sarvam Health Identity Restoration`,
+    html,
+    text
+  });
 }
 
 function buildContactEmailHtml(data) {
@@ -303,8 +333,7 @@ app.post('/api/contact', async (req, res) => {
     }
 
     console.log('Attempting to send email to:', process.env.SMTP_USER);
-    await mailerTransport.sendMail({
-      from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
+    await sendUniversalEmail({
       to: process.env.SMTP_USER,
       replyTo: `"${name}" <${email}>`,
       subject: `New ${type} from ${name}`,
@@ -771,16 +800,12 @@ app.post('/api/patients/login-password', async (req, res) => {
 
       let emailSent = false, devOtp = null;
       try {
-        await Promise.race([
-          mailerTransport.sendMail({
-            from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-            to: email,
-            subject: `${otp} - Your Sarvam Login Verification Code`,
-            html: buildLoginOtpEmailHtml(otp, patient.name),
-            text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
-        ]);
+        await sendUniversalEmail({
+          to: email,
+          subject: `${otp} - Your Sarvam Login Verification Code`,
+          html: buildLoginOtpEmailHtml(otp, patient.name),
+          text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes.`
+        });
         emailSent = true;
         console.log(`- Login OTP emailed to ${email}`);
       } catch (mailErr) {
@@ -901,16 +926,12 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
 
     let emailSent = false, devOtp = null;
     try {
-      await Promise.race([
-        mailerTransport.sendMail({
-          from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-          to: emailLower,
-          subject: `${otp} - Verify your email to register on Sarvam`,
-          html: buildLoginOtpEmailHtml(otp, role ? "Future " + (role === 'doctor' ? "Doctor" : "Patient") : "Future User", 'register'),
-          text: `Your registration verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
-      ]);
+      await sendUniversalEmail({
+        to: emailLower,
+        subject: `${otp} - Verify your email to register on Sarvam`,
+        html: buildLoginOtpEmailHtml(otp, role ? "Future " + (role === 'doctor' ? "Doctor" : "Patient") : "Future User", 'register'),
+        text: `Your registration verification code is: ${otp}. Expires in 5 minutes.`
+      });
       emailSent = true;
       console.log(`- Registration OTP emailed to ${emailLower}`);
     } catch (mailErr) {
@@ -1325,16 +1346,12 @@ app.post('/api/doctors/login', async (req, res) => {
 
       let emailSent = false, devOtp = null;
       try {
-        await Promise.race([
-          mailerTransport.sendMail({
-            from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-            to: email,
-            subject: `${otp} - Your Sarvam Login Verification Code`,
-            html: buildLoginOtpEmailHtml(otp, 'Dr. ' + doc.name),
-            text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
-        ]);
+        await sendUniversalEmail({
+          to: email,
+          subject: `${otp} - Your Sarvam Login Verification Code`,
+          html: buildLoginOtpEmailHtml(otp, 'Dr. ' + doc.name),
+          text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes.`
+        });
         emailSent = true;
         console.log(`- Doctor Login OTP emailed to ${email}`);
       } catch (mailErr) {
