@@ -48,6 +48,29 @@ mailerTransport.verify((error, success) => {
   }
 });
 
+// -- In-Memory OTP Store (bulletproof fallback for Railway) --
+const memoryOtpStore = new Map();
+function setMemoryOtp(email, otp, purpose) {
+  const key = `${email}::${purpose}`;
+  memoryOtpStore.set(key, { otp, createdAt: Date.now() });
+  // Auto-cleanup after 6 minutes
+  setTimeout(() => memoryOtpStore.delete(key), 6 * 60 * 1000);
+}
+function verifyMemoryOtp(email, otp, purpose) {
+  const key = `${email}::${purpose}`;
+  const entry = memoryOtpStore.get(key);
+  if (!entry) return false;
+  if (Date.now() - entry.createdAt > 5 * 60 * 1000) {
+    memoryOtpStore.delete(key);
+    return false;
+  }
+  if (entry.otp === otp) {
+    memoryOtpStore.delete(key);
+    return true;
+  }
+  return false;
+}
+
 // -- Branded Sarvam Email Template -----------------------
 function buildOtpEmailHtml(otp, recipientName = 'User') {
   return `
@@ -799,6 +822,7 @@ app.post('/api/patients/login-password', async (req, res) => {
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
       await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
         [email, otpHash, expiresAt, 'login_verify_patient']);
+      setMemoryOtp(email, otp, 'login_verify_patient');
 
       let emailSent = false, devOtp = null;
       try {
@@ -859,6 +883,7 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
 
     await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?, ?, ?, ?)',
       [email, otpHash, expiresAt, 'forgot_password']);
+    setMemoryOtp(email, otp, 'forgot_password');
 
     console.log(` Password Recovery OTP for ${email} (${userType}): ${otp}`);
     res.json({ success: true, message: 'OTP sent to your email (Fallback active)', dev_otp: otp });
@@ -874,10 +899,25 @@ app.post('/api/auth/reset-password', async (req, res) => {
       [email, 'forgot_password']);
 
     if (!session || new Date() > new Date(session.expires_at)) {
+      // Fallback: check in-memory store
+      if (verifyMemoryOtp(email, otp, 'forgot_password')) {
+        console.log(`- Forgot password OTP verified via MEMORY fallback for ${email}`);
+        const newHash = bcrypt.hashSync(req.body.newPassword, 10);
+        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
+        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
+        return res.json({ success: true, message: 'Password reset successful' });
+      }
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
 
     if (!bcrypt.compareSync(otp, session.otp_hash)) {
+      if (verifyMemoryOtp(email, otp, 'forgot_password')) {
+        console.log(`- Forgot password OTP verified via MEMORY fallback for ${email}`);
+        const newHash = bcrypt.hashSync(req.body.newPassword, 10);
+        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
+        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
+        return res.json({ success: true, message: 'Password reset successful' });
+      }
       return res.status(401).json({ error: 'Incorrect OTP' });
     }
 
@@ -925,6 +965,7 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 minutes
     await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
       [emailLower, otpHash, expiresAt, 'register_verify']);
+    setMemoryOtp(emailLower, otp, 'register_verify');
 
     let emailSent = false, devOtp = null;
     try {
@@ -962,8 +1003,23 @@ app.post('/api/auth/register-verify-otp', async (req, res) => {
       "SELECT * FROM otp_sessions WHERE phone=? AND purpose='register_verify' AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1",
       [emailLower]
     );
-    if (!session) return res.status(401).json({ error: 'OTP expired or not found' });
-    if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(401).json({ error: 'Incorrect OTP' });
+    if (!session) {
+      // Fallback: check in-memory store
+      if (verifyMemoryOtp(emailLower, otp, 'register_verify')) {
+        console.log(`- Register OTP verified via MEMORY fallback for ${emailLower}`);
+        return res.json({ success: true, verified_email: emailLower });
+      }
+      return res.status(401).json({ error: 'OTP expired or not found' });
+    }
+    if (!bcrypt.compareSync(otp, session.otp_hash)) {
+      // Also try memory fallback for hash mismatches
+      if (verifyMemoryOtp(emailLower, otp, 'register_verify')) {
+        console.log(`- Register OTP verified via MEMORY fallback for ${emailLower}`);
+        await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+        return res.json({ success: true, verified_email: emailLower });
+      }
+      return res.status(401).json({ error: 'Incorrect OTP' });
+    }
 
     await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
     res.json({ success: true, verified_email: emailLower });
@@ -980,9 +1036,11 @@ app.post('/api/auth/login-verify-otp', async (req, res) => {
       "SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1",
       [email, purpose]
     );
-    if (!session) return res.status(401).json({ error: 'OTP expired or not found. Please try logging in again.' });
-    if (!bcrypt.compareSync(otp, session.otp_hash)) return res.status(401).json({ error: 'Incorrect OTP' });
-    await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    const memoryVerified = verifyMemoryOtp(email, otp, purpose);
+    if (!session && !memoryVerified) return res.status(401).json({ error: 'OTP expired or not found. Please try logging in again.' });
+    if (session && !bcrypt.compareSync(otp, session.otp_hash) && !memoryVerified) return res.status(401).json({ error: 'Incorrect OTP' });
+    if (session) await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
+    if (memoryVerified) console.log(`- Login OTP verified via MEMORY fallback for ${email}`);
 
     // Issue a trusted device token
     let user, sessionData;
@@ -1345,6 +1403,7 @@ app.post('/api/doctors/login', async (req, res) => {
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
       await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
         [email, otpHash, expiresAt, 'login_verify_doctor']);
+      setMemoryOtp(email, otp, 'login_verify_doctor');
 
       let emailSent = false, devOtp = null;
       try {
