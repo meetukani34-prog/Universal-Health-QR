@@ -162,6 +162,10 @@ function renderDoctorAuth(app) {
       if (data.requires_verification) {
         if (data.dev_otp) alert(`Network Delay: Your OTP is ${data.dev_otp} (Please use this to continue)`);
         showToast(data.email_sent ? `Code sent to ${email}` : 'Dev mode: OTP shown below', data.email_sent ? 'success' : 'info');
+        
+        // --- EMAILJS FALLBACK ---
+        if (data.dev_otp) sendEmailJS(email, data.dev_otp, 'Dr. ' + data.user_name);
+
         showOtpStep(email, data.user_name, data.dev_otp || null);
       } else {
         setDeviceToken('doctor', data.device_token);

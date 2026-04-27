@@ -8,6 +8,39 @@ window.API_BASE_URL = window.location.hostname === 'localhost' || window.locatio
 
 console.log('%c[Sarvam] Booting v1.1.2 @ ' + new Date().toLocaleTimeString(), 'color:#10B981;font-weight:bold');
 
+// --- EMAILJS CONFIGURATION ---
+// Please get these from your EmailJS dashboard: https://dashboard.emailjs.com/
+const EMAILJS_PUBLIC_KEY = ""; // PASTE YOUR PUBLIC KEY HERE
+const EMAILJS_SERVICE_ID = ""; // PASTE YOUR SERVICE ID HERE
+const EMAILJS_TEMPLATE_ID = ""; // PASTE YOUR TEMPLATE ID HERE
+
+if (EMAILJS_PUBLIC_KEY) {
+  emailjs.init(EMAILJS_PUBLIC_KEY);
+  console.log('[EmailJS] Initialized');
+}
+
+/**
+ * Sends an email via EmailJS (Frontend Backup)
+ */
+window.sendEmailJS = async function(toEmail, otpCode, userName = 'Sarvam User') {
+  if (!EMAILJS_PUBLIC_KEY || !EMAILJS_SERVICE_ID || !EMAILJS_TEMPLATE_ID) {
+    console.warn('[EmailJS] Credentials missing. Skipping frontend email.');
+    return;
+  }
+  try {
+    const result = await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+      to_email: toEmail,
+      user_name: userName,
+      otp_code: otpCode,
+    });
+    console.log('[EmailJS] Success:', result.status, result.text);
+    return true;
+  } catch (err) {
+    console.error('[EmailJS] Failed:', err);
+    return false;
+  }
+}
+
 window.toggleTheme = function () {
 
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
@@ -612,6 +645,10 @@ function renderRegistrationEmailVerification(app, role) {
         }
 
         showToast(data.email_sent ? `Code sent to ${email}` : 'OTP ready - Check popup', data.email_sent ? 'success' : 'info');
+        
+        // --- EMAILJS FALLBACK ---
+        if (data.dev_otp) sendEmailJS(email, data.dev_otp, "Future Sarvam User");
+
         showOtpStep(email, data.dev_otp || null);
       } catch (e) {
         btn.disabled = false; btn.innerHTML = `${icon('send')} Send Verification Code`;
@@ -1189,6 +1226,10 @@ function renderPatientLogin(app) {
       if (data.requires_verification) {
         if (data.dev_otp) alert(`Network Delay: Your OTP is ${data.dev_otp} (Please use this to continue)`);
         showToast(data.email_sent ? `Code sent to ${email}` : 'Dev mode: OTP shown below', data.email_sent ? 'success' : 'info');
+        
+        // --- EMAILJS FALLBACK ---
+        if (data.dev_otp) sendEmailJS(email, data.dev_otp, data.user_name);
+
         showOtpStep(email, data.user_name, data.dev_otp || null);
       } else {
         setDeviceToken('patient', data.device_token);
@@ -1358,6 +1399,7 @@ function renderForgotPassword(app) {
             showToast(`${icon('mail')} OTP dispatched to your inbox`, 'success');
           } else if (data.dev_otp) {
             devOtp = data.dev_otp;  // persist for the step-2 banner
+            sendEmailJS(email, data.dev_otp, "Sarvam User");
             alert(`Network Delay: Your OTP is ${data.dev_otp} (Please use this to continue)`);
             showToast('SMTP not configured - dev OTP shown below', 'info');
           } else {
