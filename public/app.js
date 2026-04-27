@@ -4,7 +4,7 @@ window.APP = { state: {} };
 // In production, set this to your Railway URL. In dev, it stays empty for local proxying.
 window.API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
   ? '' 
-  : 'https://universal-health-qr-production.up.railway.app'; // Placeholder - user should update this
+  : 'https://universal-health-qr-production.up.railway.app';
 
 console.log('%c[Sarvam] Booting v1.1.2 @ ' + new Date().toLocaleTimeString(), 'color:#10B981;font-weight:bold');
 
