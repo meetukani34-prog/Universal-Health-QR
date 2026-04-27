@@ -31,8 +31,10 @@ const mailerConfig = {
   },
   debug: true,
   logger: true,
-  // Force IPv4 to avoid ENETUNREACH errors on some cloud providers
-  family: 4
+  family: 4,
+  connectionTimeout: 5000,
+  greetingTimeout: 5000,
+  socketTimeout: 5000
 };
 const mailerTransport = nodemailer.createTransport(mailerConfig);
 
