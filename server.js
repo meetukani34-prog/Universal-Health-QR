@@ -191,14 +191,24 @@ async function sendOtpEmail(toEmail, otp, recipientName) {
   const fromEmail = process.env.SMTP_USER;
   const fromString = `"${fromName}" <${fromEmail}>`;
 
-  const info = await mailerTransport.sendMail({
+  const mailOptions = {
     from: process.env.SMTP_FROM || fromString,
     to: toEmail,
     subject: `${otp} - Your Sarvam Identity Restoration Code`,
     html: buildOtpEmailHtml(otp, recipientName),
     text: `Your Sarvam password reset OTP is: ${otp}. It expires in 3 minutes. Do not share it with anyone.`
-  });
-  return info;
+  };
+
+  try {
+    const info = await Promise.race([
+      mailerTransport.sendMail(mailOptions),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
+    ]);
+    return info;
+  } catch (err) {
+    console.error(' - SMTP Dispatch Timeout/Failure:', err.message);
+    throw err;
+  }
 }
 
 function buildContactEmailHtml(data) {
@@ -361,10 +371,13 @@ const DB_PATH = path.join(__dirname, 'healthqr.db');
 // --- Firestore Compatibility Layer ---
 // These functions mock SQL behavior but talk to Firestore
 async function run(sql, params = []) {
+  if (!firestore) return console.warn('Skipping Firestore RUN - DB not initialized');
   try {
     const tableMatch = sql.match(/(?:INSERT INTO|UPDATE|DELETE FROM) (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return;
+
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
 
     if (sql.toUpperCase().startsWith('INSERT INTO')) {
       const colMatch = sql.match(/\((.*?)\)/);
@@ -374,31 +387,19 @@ async function run(sql, params = []) {
       cols.forEach((c, i) => data[c] = params[i]);
       data.updated_at = new Date().toISOString();
       
-      if (!firestore) {
-        console.warn('Skipping Firestore INSERT - DB not initialized');
-        return;
-      }
-      
       if (data.id) {
-        await Promise.race([
-          firestore.collection(table).doc(String(data.id)).set(data, { merge: true }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000))
-        ]);
+        await Promise.race([firestore.collection(table).doc(String(data.id)).set(data, { merge: true }), timeout]);
       } else {
-        await Promise.race([
-          firestore.collection(table).add(data),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000))
-        ]);
+        await Promise.race([firestore.collection(table).add(data), timeout]);
       }
     } else if (sql.toUpperCase().startsWith('UPDATE')) {
       const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
       if (!whereMatch) return;
       const whereClause = whereMatch[1];
-      const [whereCol, whereVal] = whereClause.split('=').map(s => s.trim().replace(/\?/, ''));
+      const [whereCol] = whereClause.split('=').map(s => s.trim().replace(/\?/, ''));
+      const qValue = params[params.length - 1]; 
       
-      const qValue = params[params.length - 1]; // Usually the last param is the WHERE value
-      const query = firestore.collection(table).where(whereCol, '==', qValue);
-      const snap = await query.get();
+      const snap = await Promise.race([firestore.collection(table).where(whereCol, '==', qValue).get(), timeout]);
       
       const updateData = {};
       const setPart = sql.match(/SET (.*?) WHERE/i)[1];
@@ -408,29 +409,30 @@ async function run(sql, params = []) {
 
       const batch = firestore.batch();
       snap.forEach(doc => batch.update(doc.ref, updateData));
-      await batch.commit();
+      await Promise.race([batch.commit(), timeout]);
     }
   } catch (err) {
-    console.error('Firestore RUN error:', err, sql);
+    console.error('Firestore RUN error:', err.message, sql);
   }
 }
 
 async function get(sql, params = []) {
+  if (!firestore) return null;
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return null;
 
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
+
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
     if (!whereMatch) {
-        const snap = await firestore.collection(table).limit(1).get();
+        const snap = await Promise.race([firestore.collection(table).limit(1).get(), timeout]);
         return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
 
     const whereClause = whereMatch[1];
-    // Handle simple "col=?" or "col = ?"
     const colName = whereClause.split('=')[0].trim();
-    
     let query = firestore.collection(table).where(colName, '==', params[0]);
     
     if (sql.includes('ORDER BY')) {
@@ -439,26 +441,28 @@ async function get(sql, params = []) {
         query = query.orderBy(orderCol, direction);
     }
     
-    const snap = await query.limit(1).get();
+    const snap = await Promise.race([query.limit(1).get(), timeout]);
     return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
   } catch (err) {
-    console.error('Firestore GET error:', err, sql);
+    console.error('Firestore GET error:', err.message, sql);
     return null;
   }
 }
 
 async function all(sql, params = []) {
+  if (!firestore) return [];
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return [];
 
-    const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
+
     let query = firestore.collection(table);
+    const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
     
     if (whereMatch) {
-        const whereClause = whereMatch[1];
-        const colName = whereClause.split('=')[0].trim();
+        const colName = whereMatch[1].split('=')[0].trim();
         query = query.where(colName, '==', params[0]);
     }
 
@@ -467,16 +471,16 @@ async function all(sql, params = []) {
         const direction = sql.includes('DESC') ? 'desc' : 'asc';
         query = query.orderBy(orderCol, direction);
     }
-    
+
     if (sql.includes('LIMIT')) {
-        const limitVal = parseInt(sql.match(/LIMIT (\d+)/i)[1]);
-        query = query.limit(limitVal);
+        const limit = parseInt(sql.match(/LIMIT (\d+)/i)[1]);
+        query = query.limit(limit);
     }
 
-    const snap = await query.get();
+    const snap = await Promise.race([query.get(), timeout]);
     return snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   } catch (err) {
-    console.error('Firestore ALL error:', err, sql);
+    console.error('Firestore ALL error:', err.message, sql);
     return [];
   }
 }
@@ -767,17 +771,20 @@ app.post('/api/patients/login-password', async (req, res) => {
 
       let emailSent = false, devOtp = null;
       try {
-        await mailerTransport.sendMail({
-          from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-          to: email,
-          subject: `${otp} - Your Sarvam Login Verification Code`,
-          html: buildLoginOtpEmailHtml(otp, patient.name),
-          text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-        });
+        await Promise.race([
+          mailerTransport.sendMail({
+            from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
+            to: email,
+            subject: `${otp} - Your Sarvam Login Verification Code`,
+            html: buildLoginOtpEmailHtml(otp, patient.name),
+            text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
+        ]);
         emailSent = true;
         console.log(`- Login OTP emailed to ${email}`);
       } catch (mailErr) {
-        console.warn('- SMTP failed, falling back to dev mode for login OTP:', mailErr.message);
+        console.warn('- SMTP failed or timed out, falling back to dev mode:', mailErr.message);
       }
       return res.json({ requires_verification: true, user_name: patient.name, email, email_sent: emailSent, dev_otp: otp });
     }
@@ -894,17 +901,20 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
 
     let emailSent = false, devOtp = null;
     try {
-      await mailerTransport.sendMail({
-        from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-        to: emailLower,
-        subject: `${otp} - Verify your email to register on Sarvam`,
-        html: buildLoginOtpEmailHtml(otp, role ? "Future " + (role === 'doctor' ? "Doctor" : "Patient") : "Future User", 'register'),
-        text: `Your registration verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-      });
+      await Promise.race([
+        mailerTransport.sendMail({
+          from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
+          to: emailLower,
+          subject: `${otp} - Verify your email to register on Sarvam`,
+          html: buildLoginOtpEmailHtml(otp, role ? "Future " + (role === 'doctor' ? "Doctor" : "Patient") : "Future User", 'register'),
+          text: `Your registration verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
+      ]);
       emailSent = true;
       console.log(`- Registration OTP emailed to ${emailLower}`);
     } catch (mailErr) {
-      console.warn('- SMTP failed, falling back to dev mode for registration OTP:', mailErr.message);
+      console.warn('- SMTP failed or timed out, falling back to dev mode:', mailErr.message);
     }
     
     // CRITICAL FALLBACK: If everything fails, log it so the user can see it in Railway logs
@@ -1315,17 +1325,20 @@ app.post('/api/doctors/login', async (req, res) => {
 
       let emailSent = false, devOtp = null;
       try {
-        await mailerTransport.sendMail({
-          from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
-          to: email,
-          subject: `${otp} - Your Sarvam Login Verification Code`,
-          html: buildLoginOtpEmailHtml(otp, 'Dr. ' + doc.name),
-          text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
-        });
+        await Promise.race([
+          mailerTransport.sendMail({
+            from: process.env.SMTP_FROM || `"${process.env.APP_NAME || 'Sarvam'}" <${process.env.SMTP_USER}>`,
+            to: email,
+            subject: `${otp} - Your Sarvam Login Verification Code`,
+            html: buildLoginOtpEmailHtml(otp, 'Dr. ' + doc.name),
+            text: `Your Sarvam login verification code is: ${otp}. Expires in 5 minutes. Do not share it.`
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP_TIMEOUT')), 5000))
+        ]);
         emailSent = true;
         console.log(`- Doctor Login OTP emailed to ${email}`);
       } catch (mailErr) {
-        console.warn('- SMTP failed, falling back to dev mode for doctor login OTP:', mailErr.message);
+        console.warn('- SMTP failed or timed out, falling back to dev mode:', mailErr.message);
       }
       return res.json({ requires_verification: true, user_name: doc.name, email, email_sent: emailSent, dev_otp: otp });
     }
