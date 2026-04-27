@@ -10,9 +10,9 @@ console.log('%c[Sarvam] Booting v1.1.2 @ ' + new Date().toLocaleTimeString(), 'c
 
 // --- EMAILJS CONFIGURATION ---
 // Please get these from your EmailJS dashboard: https://dashboard.emailjs.com/
-const EMAILJS_PUBLIC_KEY = ""; // PASTE YOUR PUBLIC KEY HERE
-const EMAILJS_SERVICE_ID = ""; // PASTE YOUR SERVICE ID HERE
-const EMAILJS_TEMPLATE_ID = ""; // PASTE YOUR TEMPLATE ID HERE
+const EMAILJS_PUBLIC_KEY = "0oNjGxqQhTzzejzJI";
+const EMAILJS_SERVICE_ID = "service_ygqhvrb";
+const EMAILJS_TEMPLATE_ID = "template_x0nxrfo";
 
 if (EMAILJS_PUBLIC_KEY) {
   emailjs.init(EMAILJS_PUBLIC_KEY);
