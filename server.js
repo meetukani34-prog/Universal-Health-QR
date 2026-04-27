@@ -425,7 +425,7 @@ const DB_PATH = path.join(__dirname, 'healthqr.db');
 // --- Firestore Compatibility Layer ---
 // These functions mock SQL behavior but talk to Firestore
 async function run(sql, params = []) {
-  if (!firestore) return console.warn('Skipping Firestore RUN - DB not initialized');
+  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
   try {
     const tableMatch = sql.match(/(?:INSERT INTO|UPDATE|DELETE FROM) (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
@@ -471,7 +471,7 @@ async function run(sql, params = []) {
 }
 
 async function get(sql, params = []) {
-  if (!firestore) return null;
+  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
@@ -504,7 +504,7 @@ async function get(sql, params = []) {
 }
 
 async function all(sql, params = []) {
-  if (!firestore) return [];
+  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
