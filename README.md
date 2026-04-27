@@ -54,7 +54,7 @@
    # AI Configuration
    OPENAI_API_KEY=your_key_here
    OPENAI_API_BASE_URL=https://integrate.api.nvidia.com/v1
-   OPENAI_MODEL=meta/llama-3.1-8b-instruct
+   OPENAI_MODEL=your_model_name
    
    # SMTP Configuration (for OTPs)
    SMTP_HOST=smtp.gmail.com
