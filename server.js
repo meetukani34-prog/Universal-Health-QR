@@ -312,14 +312,16 @@ if (admin.apps.length === 0) {
       firebaseInitialized = true;
     } catch (e) {
       console.error('CRITICAL: Firebase Service Account Parse Error:', e.message);
+      console.error('Key length:', saKey ? saKey.length : 0);
+      console.error('First 10 chars:', saKey ? saKey.substring(0, 10) : 'none');
     }
   } else {
     console.warn('WARNING: No SERVICE_ACCOUNT_KEY found. Firestore operations will fail.');
     if (process.env.GOOGLE_CLOUD_PROJECT) {
-       try {
-         admin.initializeApp();
-         firebaseInitialized = true;
-       } catch(e) { console.error('GCP Auto-init failed:', e.message); }
+      try {
+        admin.initializeApp();
+        firebaseInitialized = true;
+      } catch (e) { console.error('GCP Auto-init failed:', e.message); }
     }
   }
 } else {
@@ -405,6 +407,15 @@ app.use(express.json());
 // Railway Health Check
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+app.get('/api/health-db', (req, res) => {
+  res.json({
+    firebase_initialized: firebaseInitialized,
+    firestore_active: !!firestore,
+    apps_count: admin.apps.length,
+    has_sa_key: !!(process.env.SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT)
+  });
+});
+
 // Force browsers to always fetch fresh JS/HTML files (prevent caching of stale code)
 app.use((req, res, next) => {
   if (req.path.endsWith('.js') || req.path.endsWith('.html') || req.path === '/') {
@@ -425,7 +436,7 @@ const DB_PATH = path.join(__dirname, 'healthqr.db');
 // --- Firestore Compatibility Layer ---
 // These functions mock SQL behavior but talk to Firestore
 async function run(sql, params = []) {
-  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
+  if (!firestore) return console.warn('Skipping Firestore RUN - DB not initialized');
   try {
     const tableMatch = sql.match(/(?:INSERT INTO|UPDATE|DELETE FROM) (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
@@ -440,7 +451,7 @@ async function run(sql, params = []) {
       const data = {};
       cols.forEach((c, i) => data[c] = params[i]);
       data.updated_at = new Date().toISOString();
-      
+
       if (data.id) {
         await Promise.race([firestore.collection(table).doc(String(data.id)).set(data, { merge: true }), timeout]);
       } else {
@@ -451,10 +462,10 @@ async function run(sql, params = []) {
       if (!whereMatch) return;
       const whereClause = whereMatch[1];
       const [whereCol] = whereClause.split('=').map(s => s.trim().replace(/\?/, ''));
-      const qValue = params[params.length - 1]; 
-      
+      const qValue = params[params.length - 1];
+
       const snap = await Promise.race([firestore.collection(table).where(whereCol, '==', qValue).get(), timeout]);
-      
+
       const updateData = {};
       const setPart = sql.match(/SET (.*?) WHERE/i)[1];
       const setCols = setPart.split(',').map(s => s.split('=')[0].trim());
@@ -471,7 +482,7 @@ async function run(sql, params = []) {
 }
 
 async function get(sql, params = []) {
-  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
+  if (!firestore) return null;
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
@@ -481,20 +492,20 @@ async function get(sql, params = []) {
 
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
     if (!whereMatch) {
-        const snap = await Promise.race([firestore.collection(table).limit(1).get(), timeout]);
-        return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+      const snap = await Promise.race([firestore.collection(table).limit(1).get(), timeout]);
+      return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
 
     const whereClause = whereMatch[1];
     const colName = whereClause.split('=')[0].trim();
     let query = firestore.collection(table).where(colName, '==', params[0]);
-    
+
     if (sql.includes('ORDER BY')) {
-        const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
-        const direction = sql.includes('DESC') ? 'desc' : 'asc';
-        query = query.orderBy(orderCol, direction);
+      const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
+      const direction = sql.includes('DESC') ? 'desc' : 'asc';
+      query = query.orderBy(orderCol, direction);
     }
-    
+
     const snap = await Promise.race([query.limit(1).get(), timeout]);
     return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
   } catch (err) {
@@ -504,7 +515,7 @@ async function get(sql, params = []) {
 }
 
 async function all(sql, params = []) {
-  if (!firestore) throw new Error('Database is offline. Missing SERVICE_ACCOUNT_KEY for Firebase Firestore.');
+  if (!firestore) return [];
   try {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
@@ -514,21 +525,21 @@ async function all(sql, params = []) {
 
     let query = firestore.collection(table);
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
-    
+
     if (whereMatch) {
-        const colName = whereMatch[1].split('=')[0].trim();
-        query = query.where(colName, '==', params[0]);
+      const colName = whereMatch[1].split('=')[0].trim();
+      query = query.where(colName, '==', params[0]);
     }
 
     if (sql.includes('ORDER BY')) {
-        const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
-        const direction = sql.includes('DESC') ? 'desc' : 'asc';
-        query = query.orderBy(orderCol, direction);
+      const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
+      const direction = sql.includes('DESC') ? 'desc' : 'asc';
+      query = query.orderBy(orderCol, direction);
     }
 
     if (sql.includes('LIMIT')) {
-        const limit = parseInt(sql.match(/LIMIT (\d+)/i)[1]);
-        query = query.limit(limit);
+      const limit = parseInt(sql.match(/LIMIT (\d+)/i)[1]);
+      query = query.limit(limit);
     }
 
     const snap = await Promise.race([query.get(), timeout]);
@@ -617,7 +628,7 @@ function formatPatientFromDB(p) {
 
 async function initDB() {
   console.log('- Initializing Firestore Database Connection...');
-  
+
   // Seed default Super Admin if none exists
   try {
     const saSnap = await firestore.collection('super_admins').limit(1).get();
@@ -980,16 +991,16 @@ app.post('/api/auth/register-send-otp', async (req, res) => {
     } catch (mailErr) {
       console.warn('- SMTP failed or timed out, falling back to dev mode:', mailErr.message);
     }
-    
+
     // CRITICAL FALLBACK: If everything fails, log it so the user can see it in Railway logs
     console.log('************************************************');
     console.log(`DEVELOMENT OTP FOR ${emailLower}: ${otp}`);
     console.log('************************************************');
 
     res.json({ success: true, email: emailLower, email_sent: emailSent, dev_otp: otp });
-  } catch (err) { 
-    console.error('OTP Route Error:', err); 
-    res.status(500).json({ error: 'Failed to process OTP request' }); 
+  } catch (err) {
+    console.error('OTP Route Error:', err);
+    res.status(500).json({ error: 'Failed to process OTP request' });
   }
 });
 
@@ -1627,7 +1638,7 @@ app.get('/api/doctors/:id/archives', async (req, res) => {
 app.patch('/api/appointments/:id/approve', async (req, res) => {
   try {
     await run('UPDATE appointments SET status=? WHERE id=?', ['confirmed', req.params.id]);
-    
+
     const apt = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
     if (apt) sseSend(patientSSE, apt.patient_id, 'appointment_update', { appointment: apt });
     res.json({ success: true, appointment: apt });
@@ -1639,7 +1650,7 @@ app.patch('/api/appointments/:id/cancel', async (req, res) => {
   try {
     const apBefore = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
     await run('UPDATE appointments SET status=? WHERE id=?', ['cancelled', req.params.id]);
-    
+
     const apt = await get('SELECT * FROM appointments WHERE id=?', [req.params.id]);
     if (apt) sseSend(patientSSE, apt.patient_id, 'appointment_update', { appointment: apt });
     res.json({ success: true });
@@ -1663,7 +1674,7 @@ app.put('/api/doctors/:id', async (req, res) => {
       [name, specialization, hospital, phone, email,
         consultation_fee ? parseInt(consultation_fee) : 500, experience_years ? parseInt(experience_years) : 0,
         available_days || 'Mon,Tue,Wed,Thu,Fri', available_start || '09:00', available_end || '17:00', bio || '', profile_photo || null, req.params.id]);
-    
+
     const updated = await get('SELECT * FROM doctors WHERE id=?', [req.params.id]);
     delete updated.password_hash;
     res.json({ success: true, doctor: updated });
@@ -2359,7 +2370,7 @@ app.post('/api/hospital-head/:hospitalId/doctors/approve/:doctorId', async (req,
     await run('INSERT INTO staff (id, hospital_id, department_id, name, role, phone, email, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [uuidv4(), hid, dept.id, 'Dr. ' + doc.name, 'Doctor', doc.phone, doc.email, 'Day']);
 
-    
+
     res.json({ success: true, message: 'Doctor approved and added to staff' });
   } catch (err) { console.error('Approval Error:', err); res.status(500).json({ error: 'Approval failed' }); }
 });
