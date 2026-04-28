@@ -442,6 +442,8 @@ async function run(sql, params = []) {
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return;
 
+    console.log(`- DB RUN: ${table} | SQL: ${sql.substring(0, 50)}...`);
+
     const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
 
     if (sql.toUpperCase().startsWith('INSERT INTO')) {
@@ -487,6 +489,8 @@ async function get(sql, params = []) {
     const tableMatch = sql.match(/FROM (\w+)/i);
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return null;
+
+    console.log(`- DB GET: ${table} | Params:`, params);
 
     const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
 
@@ -656,13 +660,15 @@ async function migrateToEncryption() {
 // === PATIENT ROUTES ===
 app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
   try {
-    const { name, dob, phone, blood_group, email, password, gender, address,
+    let { name, dob, phone, blood_group, email, password, gender, address,
       immunization_status, organ_donor_status,
       emergency_contact_name, emergency_contact_relationship, emergency_contact_phone,
       insurance_provider, policy_number, abha_id, scheme_name } = req.body;
     if (!name || !dob || !phone || !blood_group || !email || !password) return res.status(400).json({ error: 'Name, DOB, Phone, Blood Group, Email, and Password are required' });
 
-    const existingEmail = await get('SELECT id FROM patients WHERE email = ?', [email]);
+    const emailLower = email.toLowerCase().trim();
+
+    const existingEmail = await get('SELECT id FROM patients WHERE email = ?', [emailLower]);
     if (existingEmail) return res.status(409).json({ error: 'Email already registered' });
 
     const patientId = generatePatientId(name, phone);
@@ -674,7 +680,7 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
     const enc = preparePatientForDB({ dob, phone, blood_group, gender, address, abha_id });
 
     await run('INSERT INTO patients (id,name,dob,phone,blood_group,email,password_hash,gender,address,photo,abha_id,qr_code_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-      [patientId, name, enc.dob, enc.phone, enc.blood_group, email, passwordHash, enc.gender || null, enc.address || null, photo, enc.abha_id || null, qrCodeDataUrl]);
+      [patientId, name, enc.dob, enc.phone, enc.blood_group, emailLower, passwordHash, enc.gender || null, enc.address || null, photo, enc.abha_id || null, qrCodeDataUrl]);
 
     let allergies = req.body.allergies || [];
     let conditions = req.body.chronic_conditions || [];
@@ -820,7 +826,8 @@ app.post('/api/patients/login-password', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const patient = await get('SELECT * FROM patients WHERE email=?', [email]);
+    const emailLower = email.toLowerCase().trim();
+    const patient = await get('SELECT * FROM patients WHERE email=?', [emailLower]);
     if (!patient) return res.status(404).json({ error: 'No patient with this email' });
     if (!bcrypt.compareSync(password, patient.password_hash)) return res.status(401).json({ error: 'Invalid password' });
 
