@@ -444,7 +444,7 @@ async function run(sql, params = []) {
 
     console.log(`- DB RUN: ${table} | SQL: ${sql.substring(0, 50)}...`);
 
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 15000));
 
     if (sql.toUpperCase().startsWith('INSERT INTO')) {
       const colMatch = sql.match(/\((.*?)\)/);
@@ -480,6 +480,7 @@ async function run(sql, params = []) {
     }
   } catch (err) {
     console.error('Firestore RUN error:', err.message, sql);
+    throw err; // Throw to allow caller to handle failure
   }
 }
 
@@ -492,7 +493,7 @@ async function get(sql, params = []) {
 
     console.log(`- DB GET: ${table} | Params:`, params);
 
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 15000));
 
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
     if (!whereMatch) {
@@ -546,7 +547,7 @@ async function all(sql, params = []) {
     const table = tableMatch ? tableMatch[1] : null;
     if (!table) return [];
 
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 5000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore Timeout')), 15000));
 
     let query = firestore.collection(table);
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
@@ -718,8 +719,10 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
 
     const enc = preparePatientForDB({ dob, phone, blood_group, gender, address, abha_id });
 
+    console.log(`- Registering patient: ${emailLower} (${patientId})`);
     await run('INSERT INTO patients (id,name,dob,phone,blood_group,email,password_hash,gender,address,photo,abha_id,qr_code_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
       [patientId, name, enc.dob, enc.phone, enc.blood_group, emailLower, passwordHash, enc.gender || null, enc.address || null, photo, enc.abha_id || null, qrCodeDataUrl]);
+    console.log(`- Patient record saved to Firestore: ${patientId}`);
 
     let allergies = req.body.allergies || [];
     let conditions = req.body.chronic_conditions || [];
@@ -737,9 +740,12 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
       await run('INSERT INTO insurance (patient_id,provider,policy_number,abha_id,scheme_name) VALUES (?,?,?,?,?)',
         [patientId, encrypt(insurance_provider) || null, encrypt(policy_number) || null, encrypt(abha_id) || null, encrypt(scheme_name) || null]);
 
-    console.log(`- Patient registered: ${name} (ID: ${patientId})`);
+    console.log(`- Registration complete for ${patientId}`);
     res.json({ success: true, patient: { id: patientId, name, phone, email, blood_group, qr_code_url: qrCodeDataUrl } });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Registration failed' }); }
+  } catch (err) {
+    console.error('CRITICAL Registration Failure:', err);
+    res.status(500).json({ error: 'Database saving failed: ' + err.message });
+  }
 });
 
 app.get('/api/patients/:id/emergency', async (req, res) => {
