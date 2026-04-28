@@ -441,8 +441,12 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Debug Logs Buffer
-const serverLogs = [];
+app.get('/api/debug/project-id', (req, res) => {
+  res.json({
+    project_id: admin.apps.length > 0 ? admin.app().options.credential.projectId : 'unknown',
+    sa_project_id: serviceAccount ? serviceAccount.project_id : 'none'
+  });
+});
 const originalLog = console.log;
 const originalError = console.error;
 console.log = (...args) => {
