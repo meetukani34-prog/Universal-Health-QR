@@ -734,7 +734,13 @@ app.post('/api/patients/register', upload.single('photo'), async (req, res) => {
     if (existingEmail) return res.status(409).json({ error: 'Email already registered' });
 
     const patientId = generatePatientId(name, phone);
-    const photo = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null;
+    let photo = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null;
+    
+    // Firestore limit is 1MB. If photo is large, omit it to save the record.
+    if (photo && photo.length > 800000) {
+      console.warn(`- Photo for ${emailLower} is too large (${Math.round(photo.length/1024)}KB), omitting from DB`);
+      photo = null; 
+    }
     const qrUrl = `${req.protocol}://${req.get('host')}/#/patient/${patientId}`;
     const qrCodeDataUrl = await QRCode.toDataURL(qrUrl, { width: 400, margin: 2, color: { dark: '#005d90', light: '#ffffff' } });
     const passwordHash = bcrypt.hashSync(password, 10);
@@ -1272,6 +1278,13 @@ app.post('/api/doctors/register', upload.fields([{ name: 'photo', maxCount: 1 },
 
     if (!medical_certificate) return res.status(400).json({ error: 'Medical certificate is mandatory' });
 
+    if (profile_photo && profile_photo.length > 500000) {
+      return res.status(400).json({ error: 'Profile photo is too large (max 500KB)' });
+    }
+    if (medical_certificate && medical_certificate.length > 500000) {
+      return res.status(400).json({ error: 'Medical certificate is too large (max 500KB)' });
+    }
+
     const id = uuidv4();
     await run(`INSERT INTO doctors (id,name,specialization,hospital,hospital_id,license_number,phone,email,password_hash,latitude,longitude,consultation_fee,experience_years,available_days,available_start,available_end,bio,profile_photo,medical_certificate,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [id, name, specialization, hospital, hospital_id || null, license_number, phone, email, bcrypt.hashSync(password, 10),
@@ -1281,7 +1294,10 @@ app.post('/api/doctors/register', upload.fields([{ name: 'photo', maxCount: 1 },
 
     console.log(`--- Doctor registered (Pending Approval): Dr. ${name} for ${hospital || 'Unknown'}`);
     res.json({ success: true, doctor: { id, name, email, specialization, hospital, status: 'pending' } });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Registration failed' }); }
+  } catch (err) {
+    console.error('Doctor registration failed:', err);
+    res.status(500).json({ error: 'Registration failed: ' + err.message });
+  }
 });
 
 // ============================================================
