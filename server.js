@@ -500,15 +500,26 @@ async function get(sql, params = []) {
       return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
 
+    let query = firestore.collection(table);
     if (whereMatch) {
       const conditions = whereMatch[1].split(/\s+AND\s+/i);
-      conditions.forEach((cond, i) => {
+      let paramIdx = 0;
+      conditions.forEach((cond) => {
         const parts = cond.split(/(=|>=|<=|>|<)/);
         if (parts.length >= 3) {
           const col = parts[0].trim();
           const op = parts[1] === '=' ? '==' : parts[1];
-          let val = params[i];
-          if (typeof val === 'string' && val.includes("datetime('now')")) val = new Date().toISOString();
+          let valStr = parts[2].trim();
+          let val;
+          if (valStr === '?') {
+            val = params[paramIdx++];
+          } else {
+            // Extract literal value (remove quotes if any)
+            val = valStr.replace(/^['"](.*)['"]$/, '$1');
+            if (val === '0') val = 0;
+            if (val === '1') val = 1;
+            if (val.includes("datetime('now')")) val = new Date().toISOString();
+          }
           query = query.where(col, op, val);
         }
       });
@@ -542,13 +553,22 @@ async function all(sql, params = []) {
 
     if (whereMatch) {
       const conditions = whereMatch[1].split(/\s+AND\s+/i);
-      conditions.forEach((cond, i) => {
+      let paramIdx = 0;
+      conditions.forEach((cond) => {
         const parts = cond.split(/(=|>=|<=|>|<)/);
         if (parts.length >= 3) {
           const col = parts[0].trim();
           const op = parts[1] === '=' ? '==' : parts[1];
-          let val = params[i];
-          if (typeof val === 'string' && val.includes("datetime('now')")) val = new Date().toISOString();
+          let valStr = parts[2].trim();
+          let val;
+          if (valStr === '?') {
+            val = params[paramIdx++];
+          } else {
+            val = valStr.replace(/^['"](.*)['"]$/, '$1');
+            if (val === '0') val = 0;
+            if (val === '1') val = 1;
+            if (val.includes("datetime('now')")) val = new Date().toISOString();
+          }
           query = query.where(col, op, val);
         }
       });
