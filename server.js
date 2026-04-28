@@ -411,7 +411,7 @@ app.get('/api/health-db', (req, res) => {
   res.json({
     firebase_initialized: admin.apps.length > 0,
     firestore_active: !!firestore,
-    project_id: admin.apps.length > 0 ? admin.app().options.credential.projectId : 'unknown',
+    project_id: admin.apps.length > 0 ? admin.app().options.projectId : 'unknown',
     apps_count: admin.apps.length,
     has_sa_key: !!process.env.FIREBASE_SERVICE_ACCOUNT
   });
@@ -568,7 +568,7 @@ async function get(sql, params = []) {
     const snap = await Promise.race([query.limit(1).get(), timeout]);
     return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
   } catch (err) {
-    console.error('Firestore GET error:', err.message, sql);
+    console.error(`Firestore GET error: ${err.message} | Code: ${err.code} | SQL: ${sql}`);
     return null;
   }
 }
