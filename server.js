@@ -20,6 +20,16 @@ const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KE
 if (resend) console.log('- Resend Mailer Ready (API Key detected)');
 const rateLimit = require('express-rate-limit');
 
+// -- Universal CORS Middleware (Apply before everything) --
+app.use(cors());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-device-token');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // -- Nodemailer Transport --------------------------------------
 const mailerConfig = {
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -49,6 +59,7 @@ mailerTransport.verify((error, success) => {
 });
 
 // -- In-Memory OTP Store (bulletproof fallback for Railway) --
+let serviceAccount = null;
 const memoryOtpStore = new Map();
 function setMemoryOtp(email, otp, purpose) {
   const key = `${email}::${purpose}`;
@@ -304,7 +315,7 @@ if (admin.apps.length === 0) {
   const saKey = process.env.SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT;
   if (saKey) {
     try {
-      const serviceAccount = JSON.parse(saKey);
+      serviceAccount = JSON.parse(saKey);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
@@ -413,7 +424,7 @@ app.get('/api/health-db', (req, res) => {
     firestore_active: !!firestore,
     project_id: admin.apps.length > 0 ? admin.app().options.projectId : 'unknown',
     apps_count: admin.apps.length,
-    has_sa_key: !!process.env.FIREBASE_SERVICE_ACCOUNT
+    has_sa_key: !!(process.env.FIREBASE_SERVICE_ACCOUNT || process.env.SERVICE_ACCOUNT_KEY)
   });
 });
 
