@@ -426,27 +426,7 @@ app.get('/api/debug/patients', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/debug/logs', (req, res) => {
-  res.json({ logs: serverLogs });
-});
-
-// Force browsers to always fetch fresh JS/HTML files (prevent caching of stale code)
-app.use((req, res, next) => {
-  if (req.path.endsWith('.js') || req.path.endsWith('.html') || req.path === '/') {
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-  }
-  next();
-});
-app.use(express.static(path.join(__dirname, 'public')));
-
-app.get('/api/debug/project-id', (req, res) => {
-  res.json({
-    project_id: admin.apps.length > 0 ? admin.app().options.credential.projectId : 'unknown',
-    sa_project_id: serviceAccount ? serviceAccount.project_id : 'none'
-  });
-});
+const serverLogs = [];
 const originalLog = console.log;
 const originalError = console.error;
 console.log = (...args) => {
@@ -459,6 +439,15 @@ console.error = (...args) => {
   if (serverLogs.length > 50) serverLogs.shift();
   originalError(...args);
 };
+
+app.get('/api/debug/logs', (req, res) => res.json({ logs: serverLogs }));
+app.get('/api/debug/project-id', (req, res) => {
+  res.json({
+    project_id: admin.apps.length > 0 ? (admin.app().options.projectId || 'N/A') : 'unknown',
+    apps: admin.apps.length,
+    sa_project_id: (typeof serviceAccount !== 'undefined' && serviceAccount) ? serviceAccount.project_id : 'none'
+  });
+});
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
