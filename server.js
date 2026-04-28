@@ -500,9 +500,19 @@ async function get(sql, params = []) {
       return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
 
-    const whereClause = whereMatch[1];
-    const colName = whereClause.split('=')[0].trim();
-    let query = firestore.collection(table).where(colName, '==', params[0]);
+    if (whereMatch) {
+      const conditions = whereMatch[1].split(/\s+AND\s+/i);
+      conditions.forEach((cond, i) => {
+        const parts = cond.split(/(=|>=|<=|>|<)/);
+        if (parts.length >= 3) {
+          const col = parts[0].trim();
+          const op = parts[1] === '=' ? '==' : parts[1];
+          let val = params[i];
+          if (typeof val === 'string' && val.includes("datetime('now')")) val = new Date().toISOString();
+          query = query.where(col, op, val);
+        }
+      });
+    }
 
     if (sql.includes('ORDER BY')) {
       const orderCol = sql.match(/ORDER BY (\w+)/i)[1];
@@ -531,8 +541,17 @@ async function all(sql, params = []) {
     const whereMatch = sql.match(/WHERE (.*?)(?:$|ORDER BY|LIMIT)/i);
 
     if (whereMatch) {
-      const colName = whereMatch[1].split('=')[0].trim();
-      query = query.where(colName, '==', params[0]);
+      const conditions = whereMatch[1].split(/\s+AND\s+/i);
+      conditions.forEach((cond, i) => {
+        const parts = cond.split(/(=|>=|<=|>|<)/);
+        if (parts.length >= 3) {
+          const col = parts[0].trim();
+          const op = parts[1] === '=' ? '==' : parts[1];
+          let val = params[i];
+          if (typeof val === 'string' && val.includes("datetime('now')")) val = new Date().toISOString();
+          query = query.where(col, op, val);
+        }
+      });
     }
 
     if (sql.includes('ORDER BY')) {
@@ -885,11 +904,11 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
-    // Check both patients and doctors
-    let user = await get('SELECT id, name FROM patients WHERE email=?', [email]);
+    const emailLower = email.toLowerCase().trim();
+    let user = await get('SELECT id, name FROM patients WHERE email=?', [emailLower]);
     let userType = 'patient';
     if (!user) {
-      user = await get('SELECT id, name FROM doctors WHERE email=?', [email]);
+      user = await get('SELECT id, name FROM doctors WHERE email=?', [emailLower]);
       userType = 'doctor';
     }
 
@@ -897,13 +916,13 @@ app.post('/api/auth/forgot-password-request', async (req, res) => {
 
     const otp = generateOTP();
     const otpHash = bcrypt.hashSync(otp, 10);
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 minutes
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?, ?, ?, ?)',
-      [email, otpHash, expiresAt, 'forgot_password']);
-    setMemoryOtp(email, otp, 'forgot_password');
+      [emailLower, otpHash, expiresAt, 'forgot_password']);
+    setMemoryOtp(emailLower, otp, 'forgot_password');
 
-    console.log(` Password Recovery OTP for ${email} (${userType}): ${otp}`);
+    console.log(` Password Recovery OTP for ${emailLower} (${userType}): ${otp}`);
     res.json({ success: true, message: 'OTP sent to your email (Fallback active)', dev_otp: otp });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
 });
@@ -912,46 +931,34 @@ app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
     if (!email || !otp || !newPassword) return res.status(400).json({ error: 'All fields are required' });
+    const emailLower = email.toLowerCase().trim();
 
     const session = await get('SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 ORDER BY expires_at DESC LIMIT 1',
-      [email, 'forgot_password']);
+      [emailLower, 'forgot_password']);
 
     if (!session || new Date() > new Date(session.expires_at)) {
-      // Fallback: check in-memory store
-      if (verifyMemoryOtp(email, otp, 'forgot_password')) {
-        console.log(`- Forgot password OTP verified via MEMORY fallback for ${email}`);
-        const newHash = bcrypt.hashSync(req.body.newPassword, 10);
-        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
-        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
+      if (verifyMemoryOtp(emailLower, otp, 'forgot_password')) {
+        const newHash = bcrypt.hashSync(newPassword, 10);
+        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, emailLower]);
+        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, emailLower]);
         return res.json({ success: true, message: 'Password reset successful' });
       }
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
 
     if (!bcrypt.compareSync(otp, session.otp_hash)) {
-      if (verifyMemoryOtp(email, otp, 'forgot_password')) {
-        console.log(`- Forgot password OTP verified via MEMORY fallback for ${email}`);
-        const newHash = bcrypt.hashSync(req.body.newPassword, 10);
-        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
-        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
+      if (verifyMemoryOtp(emailLower, otp, 'forgot_password')) {
+        const newHash = bcrypt.hashSync(newPassword, 10);
+        await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, emailLower]);
+        await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, emailLower]);
         return res.json({ success: true, message: 'Password reset successful' });
       }
       return res.status(401).json({ error: 'Incorrect OTP' });
     }
 
     const newHash = bcrypt.hashSync(newPassword, 10);
-    let updated = false;
-
-    await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, email]);
-    if (db.getRowsModified() > 0) updated = true;
-
-    if (!updated) {
-      await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, email]);
-      if (db.getRowsModified() > 0) updated = true;
-    }
-
-    if (!updated) return res.status(404).json({ error: 'User not found' });
-
+    await run('UPDATE patients SET password_hash=? WHERE email=?', [newHash, emailLower]);
+    await run('UPDATE doctors SET password_hash=? WHERE email=?', [newHash, emailLower]);
     await run('UPDATE otp_sessions SET used=1 WHERE id=?', [session.id]);
     res.json({ success: true, message: 'Password reset successful' });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed' }); }
@@ -1049,10 +1056,11 @@ app.post('/api/auth/login-verify-otp', async (req, res) => {
     const { email, role, otp } = req.body;
     if (!email || !role || !otp) return res.status(400).json({ error: 'email, role, and otp are required' });
 
+    const emailLower = email.toLowerCase().trim();
     const purpose = role === 'doctor' ? 'login_verify_doctor' : 'login_verify_patient';
     const session = await get(
       "SELECT * FROM otp_sessions WHERE phone=? AND purpose=? AND used=0 AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1",
-      [email, purpose]
+      [emailLower, purpose]
     );
     const memoryVerified = verifyMemoryOtp(email, otp, purpose);
     if (!session && !memoryVerified) return res.status(401).json({ error: 'OTP expired or not found. Please try logging in again.' });
@@ -1401,7 +1409,8 @@ app.get('/api/doctors/nearby', async (req, res) => {
 app.post('/api/doctors/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const doc = await get('SELECT * FROM doctors WHERE email=?', [email]);
+    const emailLower = email.toLowerCase().trim();
+    const doc = await get('SELECT * FROM doctors WHERE email=?', [emailLower]);
     if (!doc) return res.status(404).json({ error: 'Doctor not found' });
 
     // Approval Guard
@@ -1420,8 +1429,8 @@ app.post('/api/doctors/login', async (req, res) => {
       const otpHash = bcrypt.hashSync(otp, 10);
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
       await run('INSERT INTO otp_sessions (phone, otp_hash, expires_at, purpose) VALUES (?,?,?,?)',
-        [email, otpHash, expiresAt, 'login_verify_doctor']);
-      setMemoryOtp(email, otp, 'login_verify_doctor');
+        [emailLower, otpHash, expiresAt, 'login_verify_doctor']);
+      setMemoryOtp(emailLower, otp, 'login_verify_doctor');
 
       let emailSent = false, devOtp = null;
       try {
@@ -1512,11 +1521,12 @@ app.post('/api/sarvam/quantum-scan', async (req, res) => {
 app.post('/api/admins/register', async (req, res) => {
   try {
     const { name, organization, org_type, email, password } = req.body;
+    const emailLower = email.toLowerCase().trim();
     if (!name || !organization || !email || !password) return res.status(400).json({ error: 'All fields required' });
-    if (await get('SELECT id FROM admins WHERE email=?', [email])) return res.status(409).json({ error: 'Email exists' });
+    if (await get('SELECT id FROM admins WHERE email=?', [emailLower])) return res.status(409).json({ error: 'Email exists' });
     const id = uuidv4();
     await run('INSERT INTO admins (id,name,organization,org_type,email,password_hash) VALUES (?,?,?,?,?,?)',
-      [id, name, organization, org_type || 'Hospital', email, bcrypt.hashSync(password, 10)]);
+      [id, name, organization, org_type || 'Hospital', emailLower, bcrypt.hashSync(password, 10)]);
     res.json({ success: true, admin: { id, name, organization, org_type } });
   } catch (err) { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1524,7 +1534,8 @@ app.post('/api/admins/register', async (req, res) => {
 app.post('/api/admins/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const admin = await get('SELECT * FROM admins WHERE email=?', [email]);
+    const emailLower = email.toLowerCase().trim();
+    const admin = await get('SELECT * FROM admins WHERE email=?', [emailLower]);
     if (!admin) return res.status(404).json({ error: 'Admin not found' });
     if (!bcrypt.compareSync(password, admin.password_hash)) return res.status(401).json({ error: 'Invalid password' });
     const stats = {
