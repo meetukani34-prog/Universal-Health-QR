@@ -17,8 +17,7 @@ const { Resend } = require('resend');
 
 // Initialize Resend if key exists
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-if (resend) console.log('- Resend Mailer Ready (API Key detected)');
-const rateLimit = require('express-rate-limit');
+const app = express();
 
 // -- Universal CORS Middleware (Apply before everything) --
 app.use(cors());
@@ -353,7 +352,6 @@ const openai = new OpenAI({
   baseURL: process.env.OPENAI_API_BASE_URL || 'https://integrate.api.nvidia.com/v1'
 });
 
-const app = express();
 const PORT = parseInt(process.env.PORT || 3000);
 
 app.use(cors());
