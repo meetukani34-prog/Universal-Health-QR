@@ -416,6 +416,19 @@ app.get('/api/health-db', (req, res) => {
   });
 });
 
+app.get('/api/debug/patients', async (req, res) => {
+  try {
+    if (!firestore) return res.status(500).json({ error: 'DB not init' });
+    const snap = await firestore.collection('patients').get();
+    const emails = snap.docs.map(doc => doc.data().email);
+    res.json({ count: emails.length, emails });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/debug/logs', (req, res) => {
+  res.json({ logs: serverLogs });
+});
+
 // Force browsers to always fetch fresh JS/HTML files (prevent caching of stale code)
 app.use((req, res, next) => {
   if (req.path.endsWith('.js') || req.path.endsWith('.html') || req.path === '/') {
@@ -426,6 +439,15 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Debug Logs Buffer
+const serverLogs = [];
+const originalConsoleLog = console.log;
+console.log = (...args) => {
+  serverLogs.push(`[${new Date().toLocaleTimeString()}] ${args.join(' ')}`);
+  if (serverLogs.length > 500) serverLogs.shift();
+  originalConsoleLog.apply(console, args);
+};
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
