@@ -409,10 +409,11 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.get('/api/health-db', (req, res) => {
   res.json({
-    firebase_initialized: firebaseInitialized,
+    firebase_initialized: admin.apps.length > 0,
     firestore_active: !!firestore,
+    project_id: admin.apps.length > 0 ? admin.app().options.credential.projectId : 'unknown',
     apps_count: admin.apps.length,
-    has_sa_key: !!(process.env.SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT)
+    has_sa_key: !!process.env.FIREBASE_SERVICE_ACCOUNT
   });
 });
 
@@ -442,11 +443,17 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Debug Logs Buffer
 const serverLogs = [];
-const originalConsoleLog = console.log;
+const originalLog = console.log;
+const originalError = console.error;
 console.log = (...args) => {
   serverLogs.push(`[${new Date().toLocaleTimeString()}] ${args.join(' ')}`);
-  if (serverLogs.length > 500) serverLogs.shift();
-  originalConsoleLog.apply(console, args);
+  if (serverLogs.length > 50) serverLogs.shift();
+  originalLog(...args);
+};
+console.error = (...args) => {
+  serverLogs.push(`[${new Date().toLocaleTimeString()}] ERROR: ${args.join(' ')}`);
+  if (serverLogs.length > 50) serverLogs.shift();
+  originalError(...args);
 };
 
 const storage = multer.memoryStorage();
